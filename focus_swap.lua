@@ -1,6 +1,6 @@
 _addon.name = 'focus_swap'
 _addon.author = 'Peter + ChatGPT'
-_addon.version = '0.3'
+_addon.version = '0.4'
 _addon.command = 'fswap'
 
 local enabled = true
@@ -9,40 +9,22 @@ local debounce_until = 0
 local last_join_request = 0
 local last_state_broadcast = 0
 local last_coordinator_seen = 0
+local applied_layout_signature = nil
 
 local JOIN_RETRY_SECONDS = 0.5
 local STATE_HEARTBEAT_SECONDS = 2.0
 local COORDINATOR_TIMEOUT_SECONDS = 6.0
+local MAX_CLIENTS = 10
 
--- Monitor layout:
---   Main monitor:  1920x1080 at x=0,y=0
---   Right monitor: 1920x1080 at x=1920,y=0
+-- Monitor geometry.
 --
--- The six side slots form a 3-wide x 2-high grid while preserving the
--- approximate 1920x1035 game-window aspect ratio.
-local layouts = {
-    main  = { x = 0,    y = 0,   w = 1920, h = 1035 },
-
-    slot1 = { x = 1920, y = 172, w = 640, h = 345 },
-    slot2 = { x = 2560, y = 172, w = 640, h = 345 },
-    slot3 = { x = 3200, y = 172, w = 640, h = 345 },
-
-    slot4 = { x = 1920, y = 517, w = 640, h = 345 },
-    slot5 = { x = 2560, y = 517, w = 640, h = 345 },
-    slot6 = { x = 3200, y = 517, w = 640, h = 345 },
-}
-
-local slot_order = {
-    'slot1',
-    'slot2',
-    'slot3',
-    'slot4',
-    'slot5',
-    'slot6',
-}
+-- main is always the focused/active game window.
+-- right is the usable area of the secondary monitor, excluding the taskbar.
+local main_layout = { x = 0, y = 0, w = 1920, h = 1035 }
+local right_monitor = { x = 1920, y = 0, w = 1920, h = 1035 }
 
 -- Runtime-only state. Character names are used only as transient IPC identity;
--- there is no configured name -> slot mapping.
+-- there is no configured character -> slot mapping.
 local instance_id = nil
 local my_slot = nil
 local coordinator_id = nil
@@ -70,20 +52,175 @@ local function get_instance_id()
     return instance_id
 end
 
-local function move_to(layout_name)
-    local layout = layouts[layout_name]
+local function sync_last_focus_state()
+    last_focus = is_focused()
+end
+
+local function assignment_count()
+    local count = 0
+
+    for _ in pairs(assignments) do
+        count = count + 1
+    end
+
+    return count
+end
+
+local function side_slot_index(slot)
+    if type(slot) ~= 'string' then
+        return nil
+    end
+
+    local index = tonumber(slot:match('^slot(%d+)$'))
+    if index and index >= 1 and index <= (MAX_CLIENTS - 1) then
+        return index
+    end
+
+    return nil
+end
+
+local function is_valid_slot(slot)
+    return slot == 'main' or side_slot_index(slot) ~= nil
+end
+
+local function layout_mode(total_clients)
+    local side_count = math.max(0, total_clients - 1)
+
+    if side_count == 0 then
+        return 'main-only', 0, 0
+    elseif side_count == 1 then
+        return 'single', 1, 1
+    elseif side_count == 2 then
+        return 'two-wide', 2, 1
+    elseif side_count <= 4 then
+        return 'quad', 2, 2
+    else
+        return 'nine', 3, 3
+    end
+end
+
+local function layout_for(slot, total_clients)
+    if slot == 'main' then
+        return {
+            x = main_layout.x,
+            y = main_layout.y,
+            w = main_layout.w,
+            h = main_layout.h,
+        }
+    end
+
+    local index = side_slot_index(slot)
+    if not index then
+        return nil
+    end
+
+    local side_count = math.max(0, total_clients - 1)
+    if index > side_count then
+        return nil
+    end
+
+    local _, columns, rows = layout_mode(total_clients)
+    if columns == 0 or rows == 0 then
+        return nil
+    end
+
+    local aspect = main_layout.w / main_layout.h
+    local cell_w = math.floor(right_monitor.w / columns)
+    local natural_h = math.floor((cell_w / aspect) + 0.5)
+    local max_h = math.floor(right_monitor.h / rows)
+    local cell_h = math.min(natural_h, max_h)
+
+    local grid_w = cell_w * columns
+    local grid_h = cell_h * rows
+    local grid_x = right_monitor.x + math.floor((right_monitor.w - grid_w) / 2)
+    local grid_y = right_monitor.y + math.floor((right_monitor.h - grid_h) / 2)
+
+    local zero_index = index - 1
+    local column = zero_index % columns
+    local row = math.floor(zero_index / columns)
+
+    if row >= rows then
+        return nil
+    end
+
+    return {
+        x = grid_x + (column * cell_w),
+        y = grid_y + (row * cell_h),
+        w = cell_w,
+        h = cell_h,
+    }
+end
+
+local function geometry_signature(slot, total_clients)
+    local layout = layout_for(slot, total_clients)
     if not layout then
-        windower.add_to_chat(167, '[focus_swap] Unknown layout: ' .. tostring(layout_name))
-        return
+        return nil
+    end
+
+    return ('%s:%d:%d:%d:%d')
+        :format(slot, layout.x, layout.y, layout.w, layout.h)
+end
+
+local function move_to(slot, total_clients)
+    local layout = layout_for(slot, total_clients)
+    if not layout then
+        windower.add_to_chat(
+            167,
+            ('[focus_swap] No layout available for %s with %d clients.')
+                :format(tostring(slot), total_clients)
+        )
+        return false
     end
 
     -- Requires WinControl plugin loaded.
-    windower.send_command(('wincontrol resize %d %d; wait 0.1; wincontrol move %d %d')
-        :format(layout.w, layout.h, layout.x, layout.y))
+    windower.send_command(
+        ('wincontrol resize %d %d; wait 0.1; wincontrol move %d %d')
+            :format(layout.w, layout.h, layout.x, layout.y)
+    )
+
+    return true
 end
 
-local function sync_last_focus_state()
-    last_focus = is_focused()
+local function apply_my_layout(force)
+    local id = get_instance_id()
+    if not id then
+        return
+    end
+
+    my_slot = assignments[id]
+
+    if not my_slot then
+        applied_layout_signature = nil
+        return
+    end
+
+    local total_clients = assignment_count()
+    local signature = geometry_signature(my_slot, total_clients)
+
+    if not signature then
+        return
+    end
+
+    if force or signature ~= applied_layout_signature then
+        if move_to(my_slot, total_clients) then
+            applied_layout_signature = signature
+
+            local mode = layout_mode(total_clients)
+            windower.add_to_chat(
+                207,
+                ('[focus_swap] Runtime slot: %s | clients=%d | layout=%s%s')
+                    :format(
+                        my_slot,
+                        total_clients,
+                        mode,
+                        id == current_main and ' | main' or ''
+                    )
+            )
+
+            sync_last_focus_state()
+            debounce_until = now() + 1.0
+        end
+    end
 end
 
 local function slot_rank(slot)
@@ -91,32 +228,7 @@ local function slot_rank(slot)
         return 0
     end
 
-    for i, candidate in ipairs(slot_order) do
-        if candidate == slot then
-            return i
-        end
-    end
-
-    return 999
-end
-
-local function find_free_slot()
-    for _, slot in ipairs(slot_order) do
-        local occupied = false
-
-        for _, assigned_slot in pairs(assignments) do
-            if assigned_slot == slot then
-                occupied = true
-                break
-            end
-        end
-
-        if not occupied then
-            return slot
-        end
-    end
-
-    return nil
+    return side_slot_index(slot) or 999
 end
 
 local function ordered_assignment_ids()
@@ -138,6 +250,30 @@ local function ordered_assignment_ids()
     end)
 
     return ids
+end
+
+-- Population changes repack side clients into consecutive slots. Because slot
+-- geometry is derived from total client count, this also selects the optimal
+-- single / two-wide / quad / nine-grid layout automatically.
+local function repack_side_slots()
+    if not current_main or not assignments[current_main] then
+        return
+    end
+
+    local ordered = ordered_assignment_ids()
+    local rebuilt = {
+        [current_main] = 'main',
+    }
+    local slot_index = 1
+
+    for _, id in ipairs(ordered) do
+        if id ~= current_main and slot_index <= (MAX_CLIENTS - 1) then
+            rebuilt[id] = 'slot' .. tostring(slot_index)
+            slot_index = slot_index + 1
+        end
+    end
+
+    assignments = rebuilt
 end
 
 local function serialize_assignments()
@@ -167,34 +303,17 @@ local function broadcast_state()
     last_state_broadcast = now()
 end
 
+local function publish_state()
+    apply_my_layout(false)
+    broadcast_state()
+end
+
 local function apply_shared_state(new_coordinator, new_main, new_assignments)
-    local id = get_instance_id()
-    if not id then
-        return
-    end
-
-    local old_slot = my_slot
-
     coordinator_id = new_coordinator ~= '' and new_coordinator or nil
     current_main = new_main ~= '' and new_main or nil
     assignments = new_assignments or {}
 
-    my_slot = assignments[id]
-
-    if my_slot and my_slot ~= old_slot then
-        move_to(my_slot)
-        windower.add_to_chat(
-            207,
-            ('[focus_swap] Runtime slot: %s%s')
-                :format(
-                    my_slot,
-                    id == current_main and ' (main)' or ''
-                )
-        )
-
-        sync_last_focus_state()
-        debounce_until = now() + 1.0
-    end
+    apply_my_layout(false)
 end
 
 local function parse_state(msg)
@@ -208,7 +327,7 @@ local function parse_state(msg)
     local new_assignments = {}
 
     for id, slot in payload:gmatch('([^=;]+)=([^;]+)') do
-        if layouts[slot] then
+        if is_valid_slot(slot) then
             new_assignments[id] = slot
         end
     end
@@ -232,10 +351,7 @@ local function become_coordinator()
     my_slot = 'main'
     last_coordinator_seen = now()
 
-    move_to('main')
-    sync_last_focus_state()
-    debounce_until = now() + 1.0
-
+    apply_my_layout(true)
     windower.add_to_chat(207, '[focus_swap] Established dynamic layout coordinator.')
     broadcast_state()
     return true
@@ -257,16 +373,28 @@ local function coordinator_assign(id)
         return
     end
 
-    local slot = find_free_slot()
-    if not slot then
-        windower.add_to_chat(167, '[focus_swap] No free side slots remain for ' .. tostring(id))
+    if assignment_count() >= MAX_CLIENTS then
+        windower.add_to_chat(
+            167,
+            ('[focus_swap] Layout is full (%d clients maximum). Cannot assign %s.')
+                :format(MAX_CLIENTS, tostring(id))
+        )
         broadcast_state()
         return
     end
 
-    assignments[id] = slot
-    windower.add_to_chat(207, ('[focus_swap] Assigned %s -> %s'):format(id, slot))
-    broadcast_state()
+    -- Temporary marker so the new client participates in the repack. Nothing
+    -- is broadcast until the marker has been replaced by a real slot.
+    assignments[id] = 'pending'
+    repack_side_slots()
+
+    windower.add_to_chat(
+        207,
+        ('[focus_swap] Added %s. Reflowing %d clients.')
+            :format(id, assignment_count())
+    )
+
+    publish_state()
 end
 
 local function coordinator_promote(id)
@@ -284,20 +412,19 @@ local function coordinator_promote(id)
     assignments[id] = 'main'
     current_main = id
 
-    broadcast_state()
+    -- Population did not change, so this is intentionally only a main <->
+    -- side-slot swap. Other side windows keep their existing positions.
+    publish_state()
 end
 
 local function coordinator_remove(id)
-    local removed_slot = assignments[id]
-    if not removed_slot then
+    if not assignments[id] then
         return
     end
 
     assignments[id] = nil
 
     if id == current_main then
-        -- Keep exactly one main whenever possible. The coordinator is the
-        -- preferred fallback; otherwise use the lowest-numbered occupied slot.
         local replacement = nil
 
         if coordinator_id and assignments[coordinator_id] then
@@ -309,15 +436,16 @@ local function coordinator_remove(id)
             end
         end
 
-        if replacement then
-            assignments[replacement] = 'main'
-            current_main = replacement
-        else
-            current_main = nil
-        end
+        current_main = replacement
     end
 
-    broadcast_state()
+    if current_main then
+        repack_side_slots()
+    else
+        assignments = {}
+    end
+
+    publish_state()
 end
 
 local function coordinator_reset(requester)
@@ -325,39 +453,23 @@ local function coordinator_reset(requester)
         return
     end
 
-    local existing = ordered_assignment_ids()
-    local rebuilt = {
-        [requester] = 'main',
-    }
-
-    local slot_index = 1
-
-    for _, id in ipairs(existing) do
-        if id ~= requester then
-            local slot = slot_order[slot_index]
-            if slot then
-                rebuilt[id] = slot
-                slot_index = slot_index + 1
-            end
-        end
-    end
-
-    assignments = rebuilt
     current_main = requester
-    broadcast_state()
+    repack_side_slots()
+    publish_state()
 end
 
 local function promote_self()
     local id = get_instance_id()
-    if not id or not my_slot or my_slot == 'main' then
+
+    if not id or not my_slot or my_slot == 'main' or not coordinator_id then
         return
     end
 
-    if not coordinator_id then
-        return
+    if id == coordinator_id then
+        coordinator_promote(id)
+    else
+        windower.send_ipc_message(('focus_swap:promote_request:%s'):format(id))
     end
-
-    windower.send_ipc_message(('focus_swap:promote_request:%s'):format(id))
 end
 
 windower.register_event('ipc message', function(msg)
@@ -401,173 +513,7 @@ windower.register_event('ipc message', function(msg)
         return
     end
 
-    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)
-    if msg == 'focus_swap:coordinator_gone' then
-        coordinator_id = nil
-        last_coordinator_seen = 0
-        return
-    end
-end)
-
-windower.register_event('prerender', function()
-    if not enabled then
-        return
-    end
-
-    local id = get_instance_id()
-    if not id then
-        return
-    end
-
-    local t = now()
-
-    -- Initial startup or coordinator recovery. Only the focused client may
-    -- establish a new coordinator, preventing every instance from racing.
-    if not coordinator_id then
-        if is_focused() then
-            become_coordinator()
-        end
-        return
-    end
-
-    -- If the coordinator silently disappears, allow the focused instance to
-    -- recover the layout after a short heartbeat timeout.
-    if id ~= coordinator_id
-        and last_coordinator_seen > 0
-        and (t - last_coordinator_seen) >= COORDINATOR_TIMEOUT_SECONDS then
-
-        coordinator_id = nil
-        my_slot = nil
-        assignments = {}
-        current_main = nil
-
-        if is_focused() then
-            become_coordinator()
-        end
-
-        return
-    end
-
-    if id == coordinator_id and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
-        broadcast_state()
-    end
-
-    if not my_slot then
-        if (t - last_join_request) >= JOIN_RETRY_SECONDS then
-            request_slot()
-        end
-        return
-    end
-
-    if t < debounce_until then
-        return
-    end
-
-    local focused = is_focused()
-
-    -- Rising edge only: false -> true.
-    if focused and not last_focus then
-        promote_self()
-    end
-
-    last_focus = focused
-end)
-
-windower.register_event('unload', function()
-    local id = get_instance_id()
-    if not id then
-        return
-    end
-
-    if id == coordinator_id then
-        local handoff = nil
-
-        if current_main and current_main ~= id and assignments[current_main] then
-            handoff = current_main
-        else
-            for _, candidate in ipairs(ordered_assignment_ids()) do
-                if candidate ~= id then
-                    handoff = candidate
-                    break
-                end
-            end
-        end
-
-        assignments[id] = nil
-
-        if handoff then
-            if current_main == id then
-                assignments[handoff] = 'main'
-                current_main = handoff
-            end
-
-            windower.send_ipc_message(('focus_swap:handoff:%s'):format(handoff))
-        else
-            windower.send_ipc_message('focus_swap:coordinator_gone')
-        end
-    else
-        windower.send_ipc_message(('focus_swap:leave:%s'):format(id))
-    end
-end)
-
-windower.register_event('addon command', function(cmd, ...)
-    cmd = cmd and cmd:lower() or ''
-
-    if cmd == 'on' then
-        enabled = true
-        sync_last_focus_state()
-        windower.add_to_chat(207, '[focus_swap] Enabled.')
-
-    elseif cmd == 'off' then
-        enabled = false
-        windower.add_to_chat(207, '[focus_swap] Disabled.')
-
-    elseif cmd == 'pos' then
-        local id = get_instance_id()
-        windower.add_to_chat(
-            207,
-            ('[focus_swap] id=%s slot=%s current_main=%s coordinator=%s')
-                :format(
-                    tostring(id),
-                    tostring(my_slot),
-                    tostring(current_main),
-                    tostring(coordinator_id)
-                )
-        )
-
-    elseif cmd == 'apply' then
-        if my_slot then
-            move_to(my_slot)
-            sync_last_focus_state()
-            debounce_until = now() + 1.0
-        else
-            windower.add_to_chat(167, '[focus_swap] No runtime slot has been assigned yet.')
-        end
-
-    elseif cmd == 'reset' then
-        local id = get_instance_id()
-        if not id then
-            return
-        end
-
-        if id == coordinator_id then
-            coordinator_reset(id)
-        elseif coordinator_id then
-            windower.send_ipc_message(('focus_swap:reset_request:%s'):format(id))
-        elseif is_focused() then
-            become_coordinator()
-        end
-
-    elseif cmd == 'help' or cmd == '' then
-        windower.add_to_chat(207, '[focus_swap] Commands:')
-        windower.add_to_chat(207, '//fswap on')
-        windower.add_to_chat(207, '//fswap off')
-        windower.add_to_chat(207, '//fswap pos')
-        windower.add_to_chat(207, '//fswap apply')
-        windower.add_to_chat(207, '//fswap reset')
-    end
-end)
-)
+    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)$')
     if new_coordinator then
         if get_instance_id() == new_coordinator then
             local departing_coordinator = coordinator_id
@@ -577,21 +523,28 @@ end)
             end
 
             coordinator_id = new_coordinator
-            assignments[new_coordinator] = assignments[new_coordinator] or 'main'
+
+            if not assignments[new_coordinator] then
+                assignments[new_coordinator] = 'pending'
+            end
 
             if not current_main or not assignments[current_main] then
                 current_main = new_coordinator
-                assignments[new_coordinator] = 'main'
             end
 
+            repack_side_slots()
             last_coordinator_seen = now()
-            broadcast_state()
+            publish_state()
         end
         return
     end
 
     if msg == 'focus_swap:coordinator_gone' then
         coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
         last_coordinator_seen = 0
         return
     end
@@ -609,8 +562,8 @@ windower.register_event('prerender', function()
 
     local t = now()
 
-    -- Initial startup or coordinator recovery. Only the focused client may
-    -- establish a new coordinator, preventing every instance from racing.
+    -- Startup/recovery: only the currently focused FFXI client may establish a
+    -- coordinator, preventing multiple instances from racing for main.
     if not coordinator_id then
         if is_focused() then
             become_coordinator()
@@ -618,16 +571,17 @@ windower.register_event('prerender', function()
         return
     end
 
-    -- If the coordinator silently disappears, allow the focused instance to
-    -- recover the layout after a short heartbeat timeout.
+    -- If the coordinator disappears without a clean unload, the focused client
+    -- can rebuild the layout after the heartbeat timeout.
     if id ~= coordinator_id
         and last_coordinator_seen > 0
         and (t - last_coordinator_seen) >= COORDINATOR_TIMEOUT_SECONDS then
 
         coordinator_id = nil
-        my_slot = nil
-        assignments = {}
         current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
 
         if is_focused() then
             become_coordinator()
@@ -636,7 +590,9 @@ windower.register_event('prerender', function()
         return
     end
 
-    if id == coordinator_id and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
+    if id == coordinator_id
+        and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
+
         broadcast_state()
     end
 
@@ -681,14 +637,7 @@ windower.register_event('unload', function()
             end
         end
 
-        assignments[id] = nil
-
         if handoff then
-            if current_main == id then
-                assignments[handoff] = 'main'
-                current_main = handoff
-            end
-
             windower.send_ipc_message(('focus_swap:handoff:%s'):format(handoff))
         else
             windower.send_ipc_message('focus_swap:coordinator_gone')
@@ -712,12 +661,17 @@ windower.register_event('addon command', function(cmd, ...)
 
     elseif cmd == 'pos' then
         local id = get_instance_id()
+        local total_clients = assignment_count()
+        local mode = layout_mode(total_clients)
+
         windower.add_to_chat(
             207,
-            ('[focus_swap] id=%s slot=%s current_main=%s coordinator=%s')
+            ('[focus_swap] id=%s slot=%s clients=%d layout=%s main=%s coordinator=%s')
                 :format(
                     tostring(id),
                     tostring(my_slot),
+                    total_clients,
+                    mode,
                     tostring(current_main),
                     tostring(coordinator_id)
                 )
@@ -725,9 +679,7 @@ windower.register_event('addon command', function(cmd, ...)
 
     elseif cmd == 'apply' then
         if my_slot then
-            move_to(my_slot)
-            sync_last_focus_state()
-            debounce_until = now() + 1.0
+            apply_my_layout(true)
         else
             windower.add_to_chat(167, '[focus_swap] No runtime slot has been assigned yet.')
         end
