@@ -401,11 +401,183 @@ windower.register_event('ipc message', function(msg)
         return
     end
 
-    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)$')
+    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)
+    if msg == 'focus_swap:coordinator_gone' then
+        coordinator_id = nil
+        last_coordinator_seen = 0
+        return
+    end
+end)
+
+windower.register_event('prerender', function()
+    if not enabled then
+        return
+    end
+
+    local id = get_instance_id()
+    if not id then
+        return
+    end
+
+    local t = now()
+
+    -- Initial startup or coordinator recovery. Only the focused client may
+    -- establish a new coordinator, preventing every instance from racing.
+    if not coordinator_id then
+        if is_focused() then
+            become_coordinator()
+        end
+        return
+    end
+
+    -- If the coordinator silently disappears, allow the focused instance to
+    -- recover the layout after a short heartbeat timeout.
+    if id ~= coordinator_id
+        and last_coordinator_seen > 0
+        and (t - last_coordinator_seen) >= COORDINATOR_TIMEOUT_SECONDS then
+
+        coordinator_id = nil
+        my_slot = nil
+        assignments = {}
+        current_main = nil
+
+        if is_focused() then
+            become_coordinator()
+        end
+
+        return
+    end
+
+    if id == coordinator_id and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
+        broadcast_state()
+    end
+
+    if not my_slot then
+        if (t - last_join_request) >= JOIN_RETRY_SECONDS then
+            request_slot()
+        end
+        return
+    end
+
+    if t < debounce_until then
+        return
+    end
+
+    local focused = is_focused()
+
+    -- Rising edge only: false -> true.
+    if focused and not last_focus then
+        promote_self()
+    end
+
+    last_focus = focused
+end)
+
+windower.register_event('unload', function()
+    local id = get_instance_id()
+    if not id then
+        return
+    end
+
+    if id == coordinator_id then
+        local handoff = nil
+
+        if current_main and current_main ~= id and assignments[current_main] then
+            handoff = current_main
+        else
+            for _, candidate in ipairs(ordered_assignment_ids()) do
+                if candidate ~= id then
+                    handoff = candidate
+                    break
+                end
+            end
+        end
+
+        assignments[id] = nil
+
+        if handoff then
+            if current_main == id then
+                assignments[handoff] = 'main'
+                current_main = handoff
+            end
+
+            windower.send_ipc_message(('focus_swap:handoff:%s'):format(handoff))
+        else
+            windower.send_ipc_message('focus_swap:coordinator_gone')
+        end
+    else
+        windower.send_ipc_message(('focus_swap:leave:%s'):format(id))
+    end
+end)
+
+windower.register_event('addon command', function(cmd, ...)
+    cmd = cmd and cmd:lower() or ''
+
+    if cmd == 'on' then
+        enabled = true
+        sync_last_focus_state()
+        windower.add_to_chat(207, '[focus_swap] Enabled.')
+
+    elseif cmd == 'off' then
+        enabled = false
+        windower.add_to_chat(207, '[focus_swap] Disabled.')
+
+    elseif cmd == 'pos' then
+        local id = get_instance_id()
+        windower.add_to_chat(
+            207,
+            ('[focus_swap] id=%s slot=%s current_main=%s coordinator=%s')
+                :format(
+                    tostring(id),
+                    tostring(my_slot),
+                    tostring(current_main),
+                    tostring(coordinator_id)
+                )
+        )
+
+    elseif cmd == 'apply' then
+        if my_slot then
+            move_to(my_slot)
+            sync_last_focus_state()
+            debounce_until = now() + 1.0
+        else
+            windower.add_to_chat(167, '[focus_swap] No runtime slot has been assigned yet.')
+        end
+
+    elseif cmd == 'reset' then
+        local id = get_instance_id()
+        if not id then
+            return
+        end
+
+        if id == coordinator_id then
+            coordinator_reset(id)
+        elseif coordinator_id then
+            windower.send_ipc_message(('focus_swap:reset_request:%s'):format(id))
+        elseif is_focused() then
+            become_coordinator()
+        end
+
+    elseif cmd == 'help' or cmd == '' then
+        windower.add_to_chat(207, '[focus_swap] Commands:')
+        windower.add_to_chat(207, '//fswap on')
+        windower.add_to_chat(207, '//fswap off')
+        windower.add_to_chat(207, '//fswap pos')
+        windower.add_to_chat(207, '//fswap apply')
+        windower.add_to_chat(207, '//fswap reset')
+    end
+end)
+)
     if new_coordinator then
         if get_instance_id() == new_coordinator then
+            local departing_coordinator = coordinator_id
+
+            if departing_coordinator then
+                assignments[departing_coordinator] = nil
+            end
+
             coordinator_id = new_coordinator
-            assignments[instance_id] = assignments[instance_id] or 'main'
+            assignments[new_coordinator] = assignments[new_coordinator] or 'main'
 
             if not current_main or not assignments[current_main] then
                 current_main = new_coordinator
