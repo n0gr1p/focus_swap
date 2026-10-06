@@ -1,6 +1,6 @@
 _addon.name = 'focus_swap'
 _addon.author = 'Peter + ChatGPT'
-_addon.version = '0.4.1'
+_addon.version = '0.4.2'
 _addon.command = 'fswap'
 
 local enabled = true
@@ -10,10 +10,13 @@ local last_join_request = 0
 local last_state_broadcast = 0
 local last_coordinator_seen = 0
 local applied_layout_signature = nil
+local population_reflow_due = nil
+local population_reflow_reason = nil
 
 local JOIN_RETRY_SECONDS = 0.5
 local STATE_HEARTBEAT_SECONDS = 2.0
 local COORDINATOR_TIMEOUT_SECONDS = 6.0
+local POPULATION_SETTLE_SECONDS = 1.0
 local MAX_CLIENTS = 10
 
 -- Monitor geometry.
@@ -308,6 +311,51 @@ local function publish_state()
     broadcast_state()
 end
 
+local function schedule_population_reflow(reason)
+    if get_instance_id() ~= coordinator_id then
+        return
+    end
+
+    population_reflow_due = now() + POPULATION_SETTLE_SECONDS
+    population_reflow_reason = reason or 'population change'
+end
+
+local function settle_population_reflow()
+    if get_instance_id() ~= coordinator_id or not population_reflow_due then
+        return
+    end
+
+    population_reflow_due = nil
+
+    if current_main and assignments[current_main] then
+        repack_side_slots()
+    else
+        assignments = {}
+        current_main = nil
+    end
+
+    local total_clients = assignment_count()
+    local mode = layout_mode(total_clients)
+
+    windower.add_to_chat(
+        207,
+        ('[focus_swap] Population settled: %d clients | layout=%s | reason=%s')
+            :format(
+                total_clients,
+                mode,
+                tostring(population_reflow_reason or 'population change')
+            )
+    )
+
+    population_reflow_reason = nil
+    publish_state()
+end
+
+local function cancel_population_reflow()
+    population_reflow_due = nil
+    population_reflow_reason = nil
+end
+
 local function apply_shared_state(new_coordinator, new_main, new_assignments)
     coordinator_id = new_coordinator ~= '' and new_coordinator or nil
     current_main = new_main ~= '' and new_main or nil
@@ -369,7 +417,12 @@ end
 
 local function coordinator_assign(id)
     if assignments[id] then
-        broadcast_state()
+        -- A reloaded client may ask to join even though the coordinator still
+        -- has its real assignment. Send the stable state immediately so that
+        -- client can recover without treating it as a population change.
+        if assignments[id] ~= 'pending' then
+            broadcast_state()
+        end
         return
     end
 
@@ -383,18 +436,11 @@ local function coordinator_assign(id)
         return
     end
 
-    -- Temporary marker so the new client participates in the repack. Nothing
-    -- is broadcast until the marker has been replaced by a real slot.
+    -- Mark membership immediately, but do not repack or broadcast intermediate
+    -- geometry. Multiple joins inside the settle window collapse into one
+    -- final reflow.
     assignments[id] = 'pending'
-    repack_side_slots()
-
-    windower.add_to_chat(
-        207,
-        ('[focus_swap] Added %s. Reflowing %d clients.')
-            :format(id, assignment_count())
-    )
-
-    publish_state()
+    schedule_population_reflow('client join')
 end
 
 local function coordinator_promote(id)
@@ -439,13 +485,10 @@ local function coordinator_remove(id)
         current_main = replacement
     end
 
-    if current_main then
-        repack_side_slots()
-    else
-        assignments = {}
-    end
-
-    publish_state()
+    -- Do not resize immediately. A mass addon reload can generate many leaves
+    -- followed almost immediately by joins; all of them should collapse into
+    -- one final geometry update after the population settles.
+    schedule_population_reflow('client leave')
 end
 
 local function coordinator_reset(requester)
@@ -453,6 +496,7 @@ local function coordinator_reset(requester)
         return
     end
 
+    cancel_population_reflow()
     current_main = requester
     repack_side_slots()
 
@@ -548,9 +592,8 @@ windower.register_event('ipc message', function(msg)
                 current_main = new_coordinator
             end
 
-            repack_side_slots()
             last_coordinator_seen = now()
-            publish_state()
+            schedule_population_reflow('coordinator handoff')
         end
         return
     end
@@ -561,6 +604,7 @@ windower.register_event('ipc message', function(msg)
         assignments = {}
         my_slot = nil
         applied_layout_signature = nil
+        cancel_population_reflow()
         last_coordinator_seen = 0
         return
     end
@@ -606,9 +650,15 @@ windower.register_event('prerender', function()
         return
     end
 
-    if id == coordinator_id
+    if id == coordinator_id and population_reflow_due then
+        if t >= population_reflow_due then
+            settle_population_reflow()
+        end
+    elseif id == coordinator_id
         and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
 
+        -- Never publish dirty/intermediate membership through the heartbeat.
+        -- The settle path above owns the next authoritative geometry update.
         broadcast_state()
     end
 
