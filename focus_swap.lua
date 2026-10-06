@@ -12,6 +12,7 @@ local last_coordinator_seen = 0
 local applied_layout_signature = nil
 local population_reflow_due = nil
 local population_reflow_reason = nil
+local pending_promote_id = nil
 
 local JOIN_RETRY_SECONDS = 0.5
 local STATE_HEARTBEAT_SECONDS = 2.0
@@ -334,6 +335,25 @@ local function settle_population_reflow()
         current_main = nil
     end
 
+    -- If focus changed while membership was still settling, preserve that
+    -- intent without publishing an intermediate geometry state.
+    if pending_promote_id
+        and assignments[pending_promote_id]
+        and assignments[pending_promote_id] ~= 'main' then
+
+        local old_main = current_main
+        local old_slot = assignments[pending_promote_id]
+
+        if old_main and assignments[old_main] == 'main' then
+            assignments[old_main] = old_slot
+        end
+
+        assignments[pending_promote_id] = 'main'
+        current_main = pending_promote_id
+    end
+
+    pending_promote_id = nil
+
     local total_clients = assignment_count()
     local mode = layout_mode(total_clients)
 
@@ -354,6 +374,7 @@ end
 local function cancel_population_reflow()
     population_reflow_due = nil
     population_reflow_reason = nil
+    pending_promote_id = nil
 end
 
 local function apply_shared_state(new_coordinator, new_main, new_assignments)
@@ -418,9 +439,9 @@ end
 local function coordinator_assign(id)
     if assignments[id] then
         -- A reloaded client may ask to join even though the coordinator still
-        -- has its real assignment. Send the stable state immediately so that
-        -- client can recover without treating it as a population change.
-        if assignments[id] ~= 'pending' then
+        -- has its real assignment. Send stable state immediately only when no
+        -- population reflow is pending; otherwise wait for the settled state.
+        if assignments[id] ~= 'pending' and not population_reflow_due then
             broadcast_state()
         end
         return
@@ -432,7 +453,9 @@ local function coordinator_assign(id)
             ('[focus_swap] Layout is full (%d clients maximum). Cannot assign %s.')
                 :format(MAX_CLIENTS, tostring(id))
         )
-        broadcast_state()
+        if not population_reflow_due then
+            broadcast_state()
+        end
         return
     end
 
@@ -446,6 +469,11 @@ end
 local function coordinator_promote(id)
     local old_slot = assignments[id]
     if not old_slot or old_slot == 'main' then
+        return
+    end
+
+    if population_reflow_due then
+        pending_promote_id = id
         return
     end
 
