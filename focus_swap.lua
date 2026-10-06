@@ -1,6 +1,6 @@
 _addon.name = 'focus_swap'
 _addon.author = 'Peter + ChatGPT'
-_addon.version = '0.4'
+_addon.version = '0.4.1'
 _addon.command = 'fswap'
 
 local enabled = true
@@ -455,7 +455,18 @@ local function coordinator_reset(requester)
 
     current_main = requester
     repack_side_slots()
-    publish_state()
+
+    -- Reset must physically reapply geometry even if logical slot assignments
+    -- are unchanged. This repairs windows that were moved/resized externally.
+    apply_my_layout(true)
+    broadcast_state()
+    windower.send_ipc_message('focus_swap:force_apply')
+
+    windower.add_to_chat(
+        207,
+        ('[focus_swap] Layout reset. Reapplied %d-client geometry.')
+            :format(assignment_count())
+    )
 end
 
 local function promote_self()
@@ -478,6 +489,11 @@ windower.register_event('ipc message', function(msg)
     end
 
     if parse_state(msg) then
+        return
+    end
+
+    if msg == 'focus_swap:force_apply' then
+        apply_my_layout(true)
         return
     end
 
@@ -693,9 +709,13 @@ windower.register_event('addon command', function(cmd, ...)
         if id == coordinator_id then
             coordinator_reset(id)
         elseif coordinator_id then
+            windower.add_to_chat(207, '[focus_swap] Requesting layout reset...')
             windower.send_ipc_message(('focus_swap:reset_request:%s'):format(id))
         elseif is_focused() then
+            windower.add_to_chat(207, '[focus_swap] No coordinator found; rebuilding layout...')
             become_coordinator()
+        else
+            windower.add_to_chat(167, '[focus_swap] Reset requires a coordinator or focused client.')
         end
 
     elseif cmd == 'help' or cmd == '' then
