@@ -13,11 +13,13 @@ local applied_layout_signature = nil
 local population_reflow_due = nil
 local population_reflow_reason = nil
 local pending_promote_id = nil
+local discovery_started = nil
 
 local JOIN_RETRY_SECONDS = 0.5
 local STATE_HEARTBEAT_SECONDS = 2.0
 local COORDINATOR_TIMEOUT_SECONDS = 6.0
 local POPULATION_SETTLE_SECONDS = 1.0
+local DISCOVERY_GRACE_SECONDS = 3.0
 local MAX_CLIENTS = 10
 
 -- Monitor geometry.
@@ -331,7 +333,9 @@ local function refresh_instance_identity()
     pending_promote_id = nil
     sync_last_focus_state()
 
+    discovery_started = now()
     if live_id then
+        windower.send_ipc_message('focus_swap:discover')
         windower.add_to_chat(207,
             ('[focus_swap] Character changed: %s -> %s; waiting for fresh slot.')
                 :format(tostring(old_id), live_id))
@@ -460,6 +464,7 @@ local function parse_state(msg)
     end
 
     last_coordinator_seen = now()
+    discovery_started = nil
     apply_shared_state(new_coordinator, new_main, new_assignments)
     return true
 end
@@ -622,6 +627,13 @@ windower.register_event('ipc message', function(msg)
         return
     end
 
+    if msg == 'focus_swap:discover' then
+        if get_instance_id() == coordinator_id and not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
     if msg == 'focus_swap:force_apply' then
         apply_my_layout(true)
         return
@@ -692,6 +704,8 @@ windower.register_event('ipc message', function(msg)
         applied_layout_signature = nil
         cancel_population_reflow()
         last_coordinator_seen = 0
+        discovery_started = now()
+        windower.send_ipc_message('focus_swap:discover')
         return
     end
 end)
@@ -714,7 +728,13 @@ windower.register_event('prerender', function()
     -- Startup/recovery: only the currently focused FFXI client may establish a
     -- coordinator, preventing multiple instances from racing for main.
     if not coordinator_id then
-        if is_focused() then
+        -- A newly logged-in client must first look for an existing coordinator.
+        -- Otherwise the focused replacement can start a competing layout.
+        if not discovery_started then
+            discovery_started = t
+            windower.send_ipc_message('focus_swap:discover')
+        end
+        if is_focused() and (t - discovery_started) >= DISCOVERY_GRACE_SECONDS then
             become_coordinator()
         end
         return
