@@ -1,6 +1,6 @@
 _addon.name = 'focus_swap'
 _addon.author = 'Peter + ChatGPT'
-_addon.version = '0.4.2'
+_addon.version = '0.4.3'
 _addon.command = 'fswap'
 
 local enabled = true
@@ -43,16 +43,9 @@ local function is_focused()
     return windower.has_focus and windower.has_focus() or false
 end
 
+-- This is the identity of the currently registered client, NOT a permanent
+-- Windower process identity. It is refreshed on every prerender below.
 local function get_instance_id()
-    if instance_id then
-        return instance_id
-    end
-
-    local player = windower.ffxi.get_player()
-    if player and player.name then
-        instance_id = player.name
-    end
-
     return instance_id
 end
 
@@ -278,6 +271,71 @@ local function repack_side_slots()
     end
 
     assignments = rebuilt
+end
+
+-- Tell the surviving clients that this character has left, even when
+-- Windower stays loaded while the user returns to character select.
+local function announce_departure(id)
+    if not id then
+        return
+    end
+
+    if id == coordinator_id then
+        local handoff = nil
+        if current_main and current_main ~= id and assignments[current_main] then
+            handoff = current_main
+        else
+            for _, candidate in ipairs(ordered_assignment_ids()) do
+                if candidate ~= id then
+                    handoff = candidate
+                    break
+                end
+            end
+        end
+
+        if handoff then
+            windower.send_ipc_message(('focus_swap:handoff:%s'):format(handoff))
+        else
+            windower.send_ipc_message('focus_swap:coordinator_gone')
+        end
+    else
+        windower.send_ipc_message(('focus_swap:leave:%s'):format(id))
+    end
+end
+
+-- A logout/relogin is a membership change, not a continuation of the old
+-- character's slot. Never move a window until its new identity has joined.
+local function refresh_instance_identity()
+    local player = windower.ffxi.get_player()
+    local live_id = player and player.name or nil
+    if live_id == instance_id then
+        return
+    end
+
+    local old_id = instance_id
+    if old_id then
+        announce_departure(old_id)
+    end
+
+    instance_id = live_id
+    my_slot = nil
+    coordinator_id = nil
+    current_main = nil
+    assignments = {}
+    applied_layout_signature = nil
+    last_coordinator_seen = 0
+    last_join_request = -JOIN_RETRY_SECONDS
+    last_state_broadcast = 0
+    population_reflow_due = nil
+    population_reflow_reason = nil
+    pending_promote_id = nil
+    sync_last_focus_state()
+
+    if live_id then
+        windower.add_to_chat(207,
+            ('[focus_swap] Character changed: %s -> %s; waiting for fresh slot.')
+                :format(tostring(old_id), live_id))
+    end
 end
 
 local function serialize_assignments()
@@ -639,6 +697,9 @@ windower.register_event('ipc message', function(msg)
 end)
 
 windower.register_event('prerender', function()
+    -- Detect logout even when the addon was not unloaded. No geometry commands
+    -- are permitted while the client has no logged-in character.
+    refresh_instance_identity()
     if not enabled then
         return
     end
@@ -712,33 +773,7 @@ windower.register_event('prerender', function()
 end)
 
 windower.register_event('unload', function()
-    local id = get_instance_id()
-    if not id then
-        return
-    end
-
-    if id == coordinator_id then
-        local handoff = nil
-
-        if current_main and current_main ~= id and assignments[current_main] then
-            handoff = current_main
-        else
-            for _, candidate in ipairs(ordered_assignment_ids()) do
-                if candidate ~= id then
-                    handoff = candidate
-                    break
-                end
-            end
-        end
-
-        if handoff then
-            windower.send_ipc_message(('focus_swap:handoff:%s'):format(handoff))
-        else
-            windower.send_ipc_message('focus_swap:coordinator_gone')
-        end
-    else
-        windower.send_ipc_message(('focus_swap:leave:%s'):format(id))
-    end
+    announce_departure(get_instance_id())
 end)
 
 windower.register_event('addon command', function(cmd, ...)
