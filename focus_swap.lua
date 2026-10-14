@@ -1,6 +1,6 @@
 _addon.name = 'focus_swap'
 _addon.author = 'Peter + ChatGPT'
-_addon.version = '0.5.0'
+_addon.version = '0.5.1'
 _addon.command = 'fswap'
 
 local enabled = true
@@ -110,9 +110,50 @@ local function layout_mode(total_clients)
         return 'two-wide', 2, 1
     elseif side_count <= 4 then
         return 'quad', 2, 2
+    elseif side_count == 5 then
+        return 'three-plus-two', 3, 2
     else
         return 'nine', 3, 3
     end
+end
+
+-- With exactly five tiled clients, a 3x3 grid wastes an entire row.
+-- Use three smaller windows on top and two wider windows below. Both rows
+-- retain the same aspect ratio as the main window and share the same work area.
+local function layout_for_five_tiled(index)
+    local aspect = main_layout.w / main_layout.h
+
+    -- Three windows span 6 units (2 each); two windows also span 6
+    -- units (3 each). Total height is 5 units / aspect. Limit by both
+    -- work-area width and height so this also works on shorter monitors.
+    local unit = math.min(right_monitor.w / 6, right_monitor.h * aspect / 5)
+    local top_w = math.max(1, math.floor(unit * 2))
+    local bottom_w = math.max(1, math.floor(unit * 3))
+    local top_h = math.max(1, math.floor(top_w / aspect))
+    local bottom_h = math.max(1, math.floor(bottom_w / aspect))
+
+    local top_y = right_monitor.y
+        + math.floor((right_monitor.h - top_h - bottom_h) / 2)
+
+    if index <= 3 then
+        local top_x = right_monitor.x
+            + math.floor((right_monitor.w - 3 * top_w) / 2)
+        return {
+            x = top_x + (index - 1) * top_w,
+            y = top_y,
+            w = top_w,
+            h = top_h,
+        }
+    end
+
+    local bottom_x = right_monitor.x
+        + math.floor((right_monitor.w - 2 * bottom_w) / 2)
+    return {
+        x = bottom_x + (index - 4) * bottom_w,
+        y = top_y + top_h,
+        w = bottom_w,
+        h = bottom_h,
+    }
 end
 
 local function layout_for(slot, total_clients)
@@ -136,6 +177,10 @@ local function layout_for(slot, total_clients)
     local tiled_index = index - #fullscreen
     local tiled_count = math.max(0, total_clients - 1 - #fullscreen)
     if tiled_index > tiled_count then return nil end
+
+    if tiled_count == 5 then
+        return layout_for_five_tiled(tiled_index)
+    end
 
     local _, columns, rows = layout_mode(tiled_count + 1)
     if columns == 0 or rows == 0 then return nil end
@@ -217,7 +262,8 @@ local function apply_my_layout(force)
         if move_to(my_slot, total_clients) then
             applied_layout_signature = signature
 
-            local mode = layout_mode(total_clients)
+            local tiled_count = math.max(0, total_clients - 1 - #(full_screen_slots[selected_layout] or {}))
+            local mode = layout_mode(tiled_count + 1)
             windower.add_to_chat(
                 207,
                 ('[focus_swap] Runtime slot: %s | clients=%d | layout=%s%s')
@@ -882,7 +928,8 @@ windower.register_event('addon command', function(cmd, ...)
     elseif cmd == 'pos' then
         local id = get_instance_id()
         local total_clients = assignment_count()
-        local mode = layout_mode(total_clients)
+        local tiled_count = math.max(0, total_clients - 1 - #(full_screen_slots[selected_layout] or {}))
+        local mode = layout_mode(tiled_count + 1)
 
         windower.add_to_chat(
             207,
