@@ -1,6 +1,6 @@
 _addon.name = 'focus_swap'
 _addon.author = 'Peter + ChatGPT'
-_addon.version = '0.4.3'
+_addon.version = '0.5.0'
 _addon.command = 'fswap'
 
 local enabled = true
@@ -14,6 +14,7 @@ local population_reflow_due = nil
 local population_reflow_reason = nil
 local pending_promote_id = nil
 local discovery_started = nil
+local selected_layout = 1
 
 local JOIN_RETRY_SECONDS = 0.5
 local STATE_HEARTBEAT_SECONDS = 2.0
@@ -28,6 +29,22 @@ local MAX_CLIENTS = 10
 -- right is the usable area of the secondary monitor, excluding the taskbar.
 local main_layout = { x = 0, y = 0, w = 1920, h = 1035 }
 local right_monitor = { x = 1920, y = 0, w = 1920, h = 1035 }
+-- Usable work areas, in Windows virtual desktop coordinates. Confirm the
+-- origin and work-area height for screens 2 and 4 on this installation.
+local left_monitor = { x = -1920, y = 0, w = 1920, h = 1035 }
+local upper_monitor = { x = 0, y = -1080, w = 1920, h = 1035 }
+local layout_names = {
+    'Classic (1 + tiled 3)',
+    'Dual left (1 + 2 + tiled 3)',
+    'Triple (1 + 2 + 4 + tiled 3)',
+    'Dual top (1 + 4 + tiled 3)',
+}
+local full_screen_slots = {
+    [1] = {},
+    [2] = {left_monitor},
+    [3] = {left_monitor, upper_monitor},
+    [4] = {upper_monitor},
+}
 
 -- Runtime-only state. Character names are used only as transient IPC identity;
 -- there is no configured character -> slot mapping.
@@ -101,50 +118,46 @@ end
 local function layout_for(slot, total_clients)
     if slot == 'main' then
         return {
-            x = main_layout.x,
-            y = main_layout.y,
-            w = main_layout.w,
-            h = main_layout.h,
+            x = main_layout.x, y = main_layout.y,
+            w = main_layout.w, h = main_layout.h,
         }
     end
 
     local index = side_slot_index(slot)
-    if not index then
-        return nil
+    if not index then return nil end
+
+    local fullscreen = full_screen_slots[selected_layout] or {}
+    if index <= #fullscreen then
+        if index >= total_clients then return nil end
+        local screen = fullscreen[index]
+        return { x = screen.x, y = screen.y, w = screen.w, h = screen.h }
     end
 
-    local side_count = math.max(0, total_clients - 1)
-    if index > side_count then
-        return nil
-    end
+    local tiled_index = index - #fullscreen
+    local tiled_count = math.max(0, total_clients - 1 - #fullscreen)
+    if tiled_index > tiled_count then return nil end
 
-    local _, columns, rows = layout_mode(total_clients)
-    if columns == 0 or rows == 0 then
-        return nil
-    end
+    local _, columns, rows = layout_mode(tiled_count + 1)
+    if columns == 0 or rows == 0 then return nil end
 
     local aspect = main_layout.w / main_layout.h
     local cell_w = math.floor(right_monitor.w / columns)
     local natural_h = math.floor((cell_w / aspect) + 0.5)
     local max_h = math.floor(right_monitor.h / rows)
     local cell_h = math.min(natural_h, max_h)
-
     local grid_w = cell_w * columns
     local grid_h = cell_h * rows
     local grid_x = right_monitor.x + math.floor((right_monitor.w - grid_w) / 2)
     local grid_y = right_monitor.y + math.floor((right_monitor.h - grid_h) / 2)
 
-    local zero_index = index - 1
+    local zero_index = tiled_index - 1
     local column = zero_index % columns
     local row = math.floor(zero_index / columns)
-
-    if row >= rows then
-        return nil
-    end
+    if row >= rows then return nil end
 
     return {
-        x = grid_x + (column * cell_w),
-        y = grid_y + (row * cell_h),
+        x = grid_x + column * cell_w,
+        y = grid_y + row * cell_h,
         w = cell_w,
         h = cell_h,
     }
@@ -358,10 +371,11 @@ local function broadcast_state()
         return
     end
 
-    local msg = ('focus_swap:state:%s:%s:%s')
+    local msg = ('focus_swap:state:%s:%s:%d:%s')
         :format(
             tostring(coordinator_id or ''),
             tostring(current_main or ''),
+            selected_layout,
             serialize_assignments()
         )
 
@@ -417,11 +431,11 @@ local function settle_population_reflow()
     pending_promote_id = nil
 
     local total_clients = assignment_count()
-    local mode = layout_mode(total_clients)
+    local mode = layout_mode(math.max(1, total_clients - #(full_screen_slots[selected_layout] or {})))
 
     windower.add_to_chat(
         207,
-        ('[focus_swap] Population settled: %d clients | layout=%s | reason=%s')
+        ('[focus_swap] Population settled: %d clients | grid=%s | reason=%s')
             :format(
                 total_clients,
                 mode,
@@ -448,8 +462,1684 @@ local function apply_shared_state(new_coordinator, new_main, new_assignments)
 end
 
 local function parse_state(msg)
-    local new_coordinator, new_main, payload =
-        msg:match('^focus_swap:state:([^:]*):([^:]*):(.*)$')
+    local new_coordinator, new_main, layout_string, payload =
+        msg:match('^focus_swap:state:([^:]*):([^:]*):([1-4]):(.*)
+
+    local new_assignments = {}
+
+    for id, slot in payload:gmatch('([^=;]+)=([^;]+)') do
+        if is_valid_slot(slot) then
+            new_assignments[id] = slot
+        end
+    end
+
+    last_coordinator_seen = now()
+    discovery_started = nil
+    selected_layout = tonumber(layout_string)
+    apply_shared_state(new_coordinator, new_main, new_assignments)
+    return true
+end
+
+local function become_coordinator()
+    local id = get_instance_id()
+    if not id then
+        return false
+    end
+
+    coordinator_id = id
+    current_main = id
+    assignments = {
+        [id] = 'main',
+    }
+    my_slot = 'main'
+    last_coordinator_seen = now()
+
+    apply_my_layout(true)
+    windower.add_to_chat(207, '[focus_swap] Established dynamic layout coordinator.')
+    broadcast_state()
+    return true
+end
+
+local function request_slot()
+    local id = get_instance_id()
+    if not id or my_slot then
+        return
+    end
+
+    windower.send_ipc_message(('focus_swap:join:%s'):format(id))
+    last_join_request = now()
+end
+
+local function coordinator_assign(id)
+    if assignments[id] then
+        -- A reloaded client may ask to join even though the coordinator still
+        -- has its real assignment. Send stable state immediately only when no
+        -- population reflow is pending; otherwise wait for the settled state.
+        if assignments[id] ~= 'pending' and not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    if assignment_count() >= MAX_CLIENTS then
+        windower.add_to_chat(
+            167,
+            ('[focus_swap] Layout is full (%d clients maximum). Cannot assign %s.')
+                :format(MAX_CLIENTS, tostring(id))
+        )
+        if not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    -- Mark membership immediately, but do not repack or broadcast intermediate
+    -- geometry. Multiple joins inside the settle window collapse into one
+    -- final reflow.
+    assignments[id] = 'pending'
+    schedule_population_reflow('client join')
+end
+
+local function coordinator_promote(id)
+    local old_slot = assignments[id]
+    if not old_slot or old_slot == 'main' then
+        return
+    end
+
+    if population_reflow_due then
+        pending_promote_id = id
+        return
+    end
+
+    local old_main = current_main
+
+    if old_main and assignments[old_main] == 'main' then
+        assignments[old_main] = old_slot
+    end
+
+    assignments[id] = 'main'
+    current_main = id
+
+    -- Population did not change, so this is intentionally only a main <->
+    -- side-slot swap. Other side windows keep their existing positions.
+    publish_state()
+end
+
+local function coordinator_remove(id)
+    if not assignments[id] then
+        return
+    end
+
+    assignments[id] = nil
+
+    if id == current_main then
+        local replacement = nil
+
+        if coordinator_id and assignments[coordinator_id] then
+            replacement = coordinator_id
+        else
+            for _, candidate in ipairs(ordered_assignment_ids()) do
+                replacement = candidate
+                break
+            end
+        end
+
+        current_main = replacement
+    end
+
+    -- Do not resize immediately. A mass addon reload can generate many leaves
+    -- followed almost immediately by joins; all of them should collapse into
+    -- one final geometry update after the population settles.
+    schedule_population_reflow('client leave')
+end
+
+local function coordinator_select_layout(requester, layout)
+    if not assignments[requester] or type(layout) ~= 'number'
+        or layout < 1 or layout > 4 then
+        return
+    end
+    if selected_layout == layout then
+        return
+    end
+    selected_layout = layout
+    -- Each client applies geometry only if its signature changes. The IPC
+    -- state is authoritative and includes this preset, even across handoff.
+    broadcast_state()
+    apply_my_layout(false)
+    windower.add_to_chat(207,
+        ('[focus_swap] Layout %d: %s'):format(layout, layout_names[layout]))
+end
+
+local function coordinator_reset(requester)
+    if not assignments[requester] then
+        return
+    end
+
+    cancel_population_reflow()
+    current_main = requester
+    repack_side_slots()
+
+    -- Reset must physically reapply geometry even if logical slot assignments
+    -- are unchanged. This repairs windows that were moved/resized externally.
+    apply_my_layout(true)
+    broadcast_state()
+    windower.send_ipc_message('focus_swap:force_apply')
+
+    windower.add_to_chat(
+        207,
+        ('[focus_swap] Layout reset. Reapplied %d-client geometry.')
+            :format(assignment_count())
+    )
+end
+
+local function promote_self()
+    local id = get_instance_id()
+
+    if not id or not my_slot or my_slot == 'main' or not coordinator_id then
+        return
+    end
+
+    if id == coordinator_id then
+        coordinator_promote(id)
+    else
+        windower.send_ipc_message(('focus_swap:promote_request:%s'):format(id))
+    end
+end
+
+windower.register_event('ipc message', function(msg)
+    if type(msg) ~= 'string' then
+        return
+    end
+
+    if parse_state(msg) then
+        return
+    end
+
+    if msg == 'focus_swap:discover' then
+        if get_instance_id() == coordinator_id and not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    if msg == 'focus_swap:force_apply' then
+        apply_my_layout(true)
+        return
+    end
+
+    local id = msg:match('^focus_swap:join:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_assign(id)
+        end
+        return
+    end
+
+    id = msg:match('^focus_swap:promote_request:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_promote(id)
+        end
+        return
+    end
+
+    id = msg:match('^focus_swap:leave:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_remove(id)
+        end
+        return
+    end
+
+    local requester, layout = msg:match('^focus_swap:layout_request:([^:]+):([1-4])
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_reset(id)
+        end
+        return
+    end
+
+    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)$')
+    if new_coordinator then
+        if get_instance_id() == new_coordinator then
+            local departing_coordinator = coordinator_id
+
+            if departing_coordinator then
+                assignments[departing_coordinator] = nil
+            end
+
+            coordinator_id = new_coordinator
+
+            if not assignments[new_coordinator] then
+                assignments[new_coordinator] = 'pending'
+            end
+
+            if not current_main or not assignments[current_main] then
+                current_main = new_coordinator
+            end
+
+            last_coordinator_seen = now()
+            schedule_population_reflow('coordinator handoff')
+        end
+        return
+    end
+
+    if msg == 'focus_swap:coordinator_gone' then
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+        cancel_population_reflow()
+        last_coordinator_seen = 0
+        discovery_started = now()
+        windower.send_ipc_message('focus_swap:discover')
+        return
+    end
+end)
+
+windower.register_event('prerender', function()
+    -- Detect logout even when the addon was not unloaded. No geometry commands
+    -- are permitted while the client has no logged-in character.
+    refresh_instance_identity()
+    if not enabled then
+        return
+    end
+
+    local id = get_instance_id()
+    if not id then
+        return
+    end
+
+    local t = now()
+
+    -- Startup/recovery: only the currently focused FFXI client may establish a
+    -- coordinator, preventing multiple instances from racing for main.
+    if not coordinator_id then
+        -- A newly logged-in client must first look for an existing coordinator.
+        -- Otherwise the focused replacement can start a competing layout.
+        if not discovery_started then
+            discovery_started = t
+            windower.send_ipc_message('focus_swap:discover')
+        end
+        if is_focused() and (t - discovery_started) >= DISCOVERY_GRACE_SECONDS then
+            become_coordinator()
+        end
+        return
+    end
+
+    -- If the coordinator disappears without a clean unload, the focused client
+    -- can rebuild the layout after the heartbeat timeout.
+    if id ~= coordinator_id
+        and last_coordinator_seen > 0
+        and (t - last_coordinator_seen) >= COORDINATOR_TIMEOUT_SECONDS then
+
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+
+        if is_focused() then
+            become_coordinator()
+        end
+
+        return
+    end
+
+    if id == coordinator_id and population_reflow_due then
+        if t >= population_reflow_due then
+            settle_population_reflow()
+        end
+    elseif id == coordinator_id
+        and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
+
+        -- Never publish dirty/intermediate membership through the heartbeat.
+        -- The settle path above owns the next authoritative geometry update.
+        broadcast_state()
+    end
+
+    if not my_slot then
+        if (t - last_join_request) >= JOIN_RETRY_SECONDS then
+            request_slot()
+        end
+        return
+    end
+
+    if t < debounce_until then
+        return
+    end
+
+    local focused = is_focused()
+
+    -- Rising edge only: false -> true.
+    if focused and not last_focus then
+        promote_self()
+    end
+
+    last_focus = focused
+end)
+
+windower.register_event('unload', function()
+    announce_departure(get_instance_id())
+end)
+
+windower.register_event('addon command', function(cmd, ...)
+    cmd = cmd and cmd:lower() or ''
+
+    if cmd == 'on' then
+        enabled = true
+        sync_last_focus_state()
+        windower.add_to_chat(207, '[focus_swap] Enabled.')
+
+    elseif cmd == 'off' then
+        enabled = false
+        windower.add_to_chat(207, '[focus_swap] Disabled.')
+
+    elseif cmd == 'layout' then
+        local requested = select(1, ...)
+        if requested == 'status' then
+            windower.add_to_chat(207,
+                ('[focus_swap] Layout %d: %s | main=%s | clients=%d')
+                    :format(selected_layout, layout_names[selected_layout],
+                        tostring(current_main), assignment_count()))
+            for _, assigned_id in ipairs(ordered_assignment_ids()) do
+                windower.add_to_chat(207,
+                    ('[focus_swap] %s -> %s')
+                        :format(assigned_id, assignments[assigned_id]))
+            end
+            return
+        end
+
+        local number = requested and tonumber(requested)
+            or ((selected_layout % 4) + 1)
+        if not number or number % 1 ~= 0 or number < 1 or number > 4 then
+            windower.add_to_chat(167, '[focus_swap] Usage: //fswap layout [1-4|status]')
+            return
+        end
+        local id = get_instance_id()
+        if not id or not my_slot or not coordinator_id then
+            windower.add_to_chat(167, '[focus_swap] Wait for a coordinator and slot before changing layouts.')
+            return
+        end
+        if id == coordinator_id then
+            coordinator_select_layout(id, number)
+        else
+            windower.send_ipc_message(
+                ('focus_swap:layout_request:%s:%d'):format(id, number))
+        end
+
+    elseif cmd == 'pos' then
+        local id = get_instance_id()
+        local total_clients = assignment_count()
+        local mode = layout_mode(total_clients)
+
+        windower.add_to_chat(
+            207,
+            ('[focus_swap] id=%s slot=%s clients=%d layout=%s main=%s coordinator=%s')
+                :format(
+                    tostring(id),
+                    tostring(my_slot),
+                    total_clients,
+                    mode,
+                    tostring(current_main),
+                    tostring(coordinator_id)
+                )
+        )
+
+    elseif cmd == 'apply' then
+        if my_slot then
+            apply_my_layout(true)
+        else
+            windower.add_to_chat(167, '[focus_swap] No runtime slot has been assigned yet.')
+        end
+
+    elseif cmd == 'reset' then
+        local id = get_instance_id()
+        if not id then
+            return
+        end
+
+        if id == coordinator_id then
+            coordinator_reset(id)
+        elseif coordinator_id then
+            windower.add_to_chat(207, '[focus_swap] Requesting layout reset...')
+            windower.send_ipc_message(('focus_swap:reset_request:%s'):format(id))
+        elseif is_focused() then
+            windower.add_to_chat(207, '[focus_swap] No coordinator found; rebuilding layout...')
+            become_coordinator()
+        else
+            windower.add_to_chat(167, '[focus_swap] Reset requires a coordinator or focused client.')
+        end
+
+    elseif cmd == 'help' or cmd == '' then
+        windower.add_to_chat(207, '[focus_swap] Commands:')
+        windower.add_to_chat(207, '//fswap on')
+        windower.add_to_chat(207, '//fswap off')
+        windower.add_to_chat(207, '//fswap pos')
+        windower.add_to_chat(207, '//fswap layout [1-4|status]')
+        windower.add_to_chat(207, '//fswap apply')
+        windower.add_to_chat(207, '//fswap reset')
+    end
+end))
+
+    if not new_coordinator then
+        return false
+    end
+
+    local new_assignments = {}
+
+    for id, slot in payload:gmatch('([^=;]+)=([^;]+)') do
+        if is_valid_slot(slot) then
+            new_assignments[id] = slot
+        end
+    end
+
+    last_coordinator_seen = now()
+    discovery_started = nil
+    apply_shared_state(new_coordinator, new_main, new_assignments)
+    return true
+end
+
+local function become_coordinator()
+    local id = get_instance_id()
+    if not id then
+        return false
+    end
+
+    coordinator_id = id
+    current_main = id
+    assignments = {
+        [id] = 'main',
+    }
+    my_slot = 'main'
+    last_coordinator_seen = now()
+
+    apply_my_layout(true)
+    windower.add_to_chat(207, '[focus_swap] Established dynamic layout coordinator.')
+    broadcast_state()
+    return true
+end
+
+local function request_slot()
+    local id = get_instance_id()
+    if not id or my_slot then
+        return
+    end
+
+    windower.send_ipc_message(('focus_swap:join:%s'):format(id))
+    last_join_request = now()
+end
+
+local function coordinator_assign(id)
+    if assignments[id] then
+        -- A reloaded client may ask to join even though the coordinator still
+        -- has its real assignment. Send stable state immediately only when no
+        -- population reflow is pending; otherwise wait for the settled state.
+        if assignments[id] ~= 'pending' and not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    if assignment_count() >= MAX_CLIENTS then
+        windower.add_to_chat(
+            167,
+            ('[focus_swap] Layout is full (%d clients maximum). Cannot assign %s.')
+                :format(MAX_CLIENTS, tostring(id))
+        )
+        if not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    -- Mark membership immediately, but do not repack or broadcast intermediate
+    -- geometry. Multiple joins inside the settle window collapse into one
+    -- final reflow.
+    assignments[id] = 'pending'
+    schedule_population_reflow('client join')
+end
+
+local function coordinator_promote(id)
+    local old_slot = assignments[id]
+    if not old_slot or old_slot == 'main' then
+        return
+    end
+
+    if population_reflow_due then
+        pending_promote_id = id
+        return
+    end
+
+    local old_main = current_main
+
+    if old_main and assignments[old_main] == 'main' then
+        assignments[old_main] = old_slot
+    end
+
+    assignments[id] = 'main'
+    current_main = id
+
+    -- Population did not change, so this is intentionally only a main <->
+    -- side-slot swap. Other side windows keep their existing positions.
+    publish_state()
+end
+
+local function coordinator_remove(id)
+    if not assignments[id] then
+        return
+    end
+
+    assignments[id] = nil
+
+    if id == current_main then
+        local replacement = nil
+
+        if coordinator_id and assignments[coordinator_id] then
+            replacement = coordinator_id
+        else
+            for _, candidate in ipairs(ordered_assignment_ids()) do
+                replacement = candidate
+                break
+            end
+        end
+
+        current_main = replacement
+    end
+
+    -- Do not resize immediately. A mass addon reload can generate many leaves
+    -- followed almost immediately by joins; all of them should collapse into
+    -- one final geometry update after the population settles.
+    schedule_population_reflow('client leave')
+end
+
+local function coordinator_reset(requester)
+    if not assignments[requester] then
+        return
+    end
+
+    cancel_population_reflow()
+    current_main = requester
+    repack_side_slots()
+
+    -- Reset must physically reapply geometry even if logical slot assignments
+    -- are unchanged. This repairs windows that were moved/resized externally.
+    apply_my_layout(true)
+    broadcast_state()
+    windower.send_ipc_message('focus_swap:force_apply')
+
+    windower.add_to_chat(
+        207,
+        ('[focus_swap] Layout reset. Reapplied %d-client geometry.')
+            :format(assignment_count())
+    )
+end
+
+local function promote_self()
+    local id = get_instance_id()
+
+    if not id or not my_slot or my_slot == 'main' or not coordinator_id then
+        return
+    end
+
+    if id == coordinator_id then
+        coordinator_promote(id)
+    else
+        windower.send_ipc_message(('focus_swap:promote_request:%s'):format(id))
+    end
+end
+
+windower.register_event('ipc message', function(msg)
+    if type(msg) ~= 'string' then
+        return
+    end
+
+    if parse_state(msg) then
+        return
+    end
+
+    if msg == 'focus_swap:discover' then
+        if get_instance_id() == coordinator_id and not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    if msg == 'focus_swap:force_apply' then
+        apply_my_layout(true)
+        return
+    end
+
+    local id = msg:match('^focus_swap:join:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_assign(id)
+        end
+        return
+    end
+
+    id = msg:match('^focus_swap:promote_request:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_promote(id)
+        end
+        return
+    end
+
+    id = msg:match('^focus_swap:leave:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_remove(id)
+        end
+        return
+    end
+
+    id = msg:match('^focus_swap:reset_request:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_reset(id)
+        end
+        return
+    end
+
+    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)$')
+    if new_coordinator then
+        if get_instance_id() == new_coordinator then
+            local departing_coordinator = coordinator_id
+
+            if departing_coordinator then
+                assignments[departing_coordinator] = nil
+            end
+
+            coordinator_id = new_coordinator
+
+            if not assignments[new_coordinator] then
+                assignments[new_coordinator] = 'pending'
+            end
+
+            if not current_main or not assignments[current_main] then
+                current_main = new_coordinator
+            end
+
+            last_coordinator_seen = now()
+            schedule_population_reflow('coordinator handoff')
+        end
+        return
+    end
+
+    if msg == 'focus_swap:coordinator_gone' then
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+        cancel_population_reflow()
+        last_coordinator_seen = 0
+        discovery_started = now()
+        windower.send_ipc_message('focus_swap:discover')
+        return
+    end
+end)
+
+windower.register_event('prerender', function()
+    -- Detect logout even when the addon was not unloaded. No geometry commands
+    -- are permitted while the client has no logged-in character.
+    refresh_instance_identity()
+    if not enabled then
+        return
+    end
+
+    local id = get_instance_id()
+    if not id then
+        return
+    end
+
+    local t = now()
+
+    -- Startup/recovery: only the currently focused FFXI client may establish a
+    -- coordinator, preventing multiple instances from racing for main.
+    if not coordinator_id then
+        -- A newly logged-in client must first look for an existing coordinator.
+        -- Otherwise the focused replacement can start a competing layout.
+        if not discovery_started then
+            discovery_started = t
+            windower.send_ipc_message('focus_swap:discover')
+        end
+        if is_focused() and (t - discovery_started) >= DISCOVERY_GRACE_SECONDS then
+            become_coordinator()
+        end
+        return
+    end
+
+    -- If the coordinator disappears without a clean unload, the focused client
+    -- can rebuild the layout after the heartbeat timeout.
+    if id ~= coordinator_id
+        and last_coordinator_seen > 0
+        and (t - last_coordinator_seen) >= COORDINATOR_TIMEOUT_SECONDS then
+
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+
+        if is_focused() then
+            become_coordinator()
+        end
+
+        return
+    end
+
+    if id == coordinator_id and population_reflow_due then
+        if t >= population_reflow_due then
+            settle_population_reflow()
+        end
+    elseif id == coordinator_id
+        and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
+
+        -- Never publish dirty/intermediate membership through the heartbeat.
+        -- The settle path above owns the next authoritative geometry update.
+        broadcast_state()
+    end
+
+    if not my_slot then
+        if (t - last_join_request) >= JOIN_RETRY_SECONDS then
+            request_slot()
+        end
+        return
+    end
+
+    if t < debounce_until then
+        return
+    end
+
+    local focused = is_focused()
+
+    -- Rising edge only: false -> true.
+    if focused and not last_focus then
+        promote_self()
+    end
+
+    last_focus = focused
+end)
+
+windower.register_event('unload', function()
+    announce_departure(get_instance_id())
+end)
+
+windower.register_event('addon command', function(cmd, ...)
+    cmd = cmd and cmd:lower() or ''
+
+    if cmd == 'on' then
+        enabled = true
+        sync_last_focus_state()
+        windower.add_to_chat(207, '[focus_swap] Enabled.')
+
+    elseif cmd == 'off' then
+        enabled = false
+        windower.add_to_chat(207, '[focus_swap] Disabled.')
+
+    elseif cmd == 'pos' then
+        local id = get_instance_id()
+        local total_clients = assignment_count()
+        local mode = layout_mode(total_clients)
+
+        windower.add_to_chat(
+            207,
+            ('[focus_swap] id=%s slot=%s clients=%d layout=%s main=%s coordinator=%s')
+                :format(
+                    tostring(id),
+                    tostring(my_slot),
+                    total_clients,
+                    mode,
+                    tostring(current_main),
+                    tostring(coordinator_id)
+                )
+        )
+
+    elseif cmd == 'apply' then
+        if my_slot then
+            apply_my_layout(true)
+        else
+            windower.add_to_chat(167, '[focus_swap] No runtime slot has been assigned yet.')
+        end
+
+    elseif cmd == 'reset' then
+        local id = get_instance_id()
+        if not id then
+            return
+        end
+
+        if id == coordinator_id then
+            coordinator_reset(id)
+        elseif coordinator_id then
+            windower.add_to_chat(207, '[focus_swap] Requesting layout reset...')
+            windower.send_ipc_message(('focus_swap:reset_request:%s'):format(id))
+        elseif is_focused() then
+            windower.add_to_chat(207, '[focus_swap] No coordinator found; rebuilding layout...')
+            become_coordinator()
+        else
+            windower.add_to_chat(167, '[focus_swap] Reset requires a coordinator or focused client.')
+        end
+
+    elseif cmd == 'help' or cmd == '' then
+        windower.add_to_chat(207, '[focus_swap] Commands:')
+        windower.add_to_chat(207, '//fswap on')
+        windower.add_to_chat(207, '//fswap off')
+        windower.add_to_chat(207, '//fswap pos')
+        windower.add_to_chat(207, '//fswap apply')
+        windower.add_to_chat(207, '//fswap reset')
+    end
+end))
+    if requester and get_instance_id() == coordinator_id then
+        coordinator_select_layout(requester, tonumber(layout))
+        return
+    end
+
+    id = msg:match('^focus_swap:reset_request:([^:]+)
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_reset(id)
+        end
+        return
+    end
+
+    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)$')
+    if new_coordinator then
+        if get_instance_id() == new_coordinator then
+            local departing_coordinator = coordinator_id
+
+            if departing_coordinator then
+                assignments[departing_coordinator] = nil
+            end
+
+            coordinator_id = new_coordinator
+
+            if not assignments[new_coordinator] then
+                assignments[new_coordinator] = 'pending'
+            end
+
+            if not current_main or not assignments[current_main] then
+                current_main = new_coordinator
+            end
+
+            last_coordinator_seen = now()
+            schedule_population_reflow('coordinator handoff')
+        end
+        return
+    end
+
+    if msg == 'focus_swap:coordinator_gone' then
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+        cancel_population_reflow()
+        last_coordinator_seen = 0
+        discovery_started = now()
+        windower.send_ipc_message('focus_swap:discover')
+        return
+    end
+end)
+
+windower.register_event('prerender', function()
+    -- Detect logout even when the addon was not unloaded. No geometry commands
+    -- are permitted while the client has no logged-in character.
+    refresh_instance_identity()
+    if not enabled then
+        return
+    end
+
+    local id = get_instance_id()
+    if not id then
+        return
+    end
+
+    local t = now()
+
+    -- Startup/recovery: only the currently focused FFXI client may establish a
+    -- coordinator, preventing multiple instances from racing for main.
+    if not coordinator_id then
+        -- A newly logged-in client must first look for an existing coordinator.
+        -- Otherwise the focused replacement can start a competing layout.
+        if not discovery_started then
+            discovery_started = t
+            windower.send_ipc_message('focus_swap:discover')
+        end
+        if is_focused() and (t - discovery_started) >= DISCOVERY_GRACE_SECONDS then
+            become_coordinator()
+        end
+        return
+    end
+
+    -- If the coordinator disappears without a clean unload, the focused client
+    -- can rebuild the layout after the heartbeat timeout.
+    if id ~= coordinator_id
+        and last_coordinator_seen > 0
+        and (t - last_coordinator_seen) >= COORDINATOR_TIMEOUT_SECONDS then
+
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+
+        if is_focused() then
+            become_coordinator()
+        end
+
+        return
+    end
+
+    if id == coordinator_id and population_reflow_due then
+        if t >= population_reflow_due then
+            settle_population_reflow()
+        end
+    elseif id == coordinator_id
+        and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
+
+        -- Never publish dirty/intermediate membership through the heartbeat.
+        -- The settle path above owns the next authoritative geometry update.
+        broadcast_state()
+    end
+
+    if not my_slot then
+        if (t - last_join_request) >= JOIN_RETRY_SECONDS then
+            request_slot()
+        end
+        return
+    end
+
+    if t < debounce_until then
+        return
+    end
+
+    local focused = is_focused()
+
+    -- Rising edge only: false -> true.
+    if focused and not last_focus then
+        promote_self()
+    end
+
+    last_focus = focused
+end)
+
+windower.register_event('unload', function()
+    announce_departure(get_instance_id())
+end)
+
+windower.register_event('addon command', function(cmd, ...)
+    cmd = cmd and cmd:lower() or ''
+
+    if cmd == 'on' then
+        enabled = true
+        sync_last_focus_state()
+        windower.add_to_chat(207, '[focus_swap] Enabled.')
+
+    elseif cmd == 'off' then
+        enabled = false
+        windower.add_to_chat(207, '[focus_swap] Disabled.')
+
+    elseif cmd == 'pos' then
+        local id = get_instance_id()
+        local total_clients = assignment_count()
+        local mode = layout_mode(total_clients)
+
+        windower.add_to_chat(
+            207,
+            ('[focus_swap] id=%s slot=%s clients=%d layout=%s main=%s coordinator=%s')
+                :format(
+                    tostring(id),
+                    tostring(my_slot),
+                    total_clients,
+                    mode,
+                    tostring(current_main),
+                    tostring(coordinator_id)
+                )
+        )
+
+    elseif cmd == 'apply' then
+        if my_slot then
+            apply_my_layout(true)
+        else
+            windower.add_to_chat(167, '[focus_swap] No runtime slot has been assigned yet.')
+        end
+
+    elseif cmd == 'reset' then
+        local id = get_instance_id()
+        if not id then
+            return
+        end
+
+        if id == coordinator_id then
+            coordinator_reset(id)
+        elseif coordinator_id then
+            windower.add_to_chat(207, '[focus_swap] Requesting layout reset...')
+            windower.send_ipc_message(('focus_swap:reset_request:%s'):format(id))
+        elseif is_focused() then
+            windower.add_to_chat(207, '[focus_swap] No coordinator found; rebuilding layout...')
+            become_coordinator()
+        else
+            windower.add_to_chat(167, '[focus_swap] Reset requires a coordinator or focused client.')
+        end
+
+    elseif cmd == 'help' or cmd == '' then
+        windower.add_to_chat(207, '[focus_swap] Commands:')
+        windower.add_to_chat(207, '//fswap on')
+        windower.add_to_chat(207, '//fswap off')
+        windower.add_to_chat(207, '//fswap pos')
+        windower.add_to_chat(207, '//fswap apply')
+        windower.add_to_chat(207, '//fswap reset')
+    end
+end))
+
+    if not new_coordinator then
+        return false
+    end
+
+    local new_assignments = {}
+
+    for id, slot in payload:gmatch('([^=;]+)=([^;]+)') do
+        if is_valid_slot(slot) then
+            new_assignments[id] = slot
+        end
+    end
+
+    last_coordinator_seen = now()
+    discovery_started = nil
+    apply_shared_state(new_coordinator, new_main, new_assignments)
+    return true
+end
+
+local function become_coordinator()
+    local id = get_instance_id()
+    if not id then
+        return false
+    end
+
+    coordinator_id = id
+    current_main = id
+    assignments = {
+        [id] = 'main',
+    }
+    my_slot = 'main'
+    last_coordinator_seen = now()
+
+    apply_my_layout(true)
+    windower.add_to_chat(207, '[focus_swap] Established dynamic layout coordinator.')
+    broadcast_state()
+    return true
+end
+
+local function request_slot()
+    local id = get_instance_id()
+    if not id or my_slot then
+        return
+    end
+
+    windower.send_ipc_message(('focus_swap:join:%s'):format(id))
+    last_join_request = now()
+end
+
+local function coordinator_assign(id)
+    if assignments[id] then
+        -- A reloaded client may ask to join even though the coordinator still
+        -- has its real assignment. Send stable state immediately only when no
+        -- population reflow is pending; otherwise wait for the settled state.
+        if assignments[id] ~= 'pending' and not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    if assignment_count() >= MAX_CLIENTS then
+        windower.add_to_chat(
+            167,
+            ('[focus_swap] Layout is full (%d clients maximum). Cannot assign %s.')
+                :format(MAX_CLIENTS, tostring(id))
+        )
+        if not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    -- Mark membership immediately, but do not repack or broadcast intermediate
+    -- geometry. Multiple joins inside the settle window collapse into one
+    -- final reflow.
+    assignments[id] = 'pending'
+    schedule_population_reflow('client join')
+end
+
+local function coordinator_promote(id)
+    local old_slot = assignments[id]
+    if not old_slot or old_slot == 'main' then
+        return
+    end
+
+    if population_reflow_due then
+        pending_promote_id = id
+        return
+    end
+
+    local old_main = current_main
+
+    if old_main and assignments[old_main] == 'main' then
+        assignments[old_main] = old_slot
+    end
+
+    assignments[id] = 'main'
+    current_main = id
+
+    -- Population did not change, so this is intentionally only a main <->
+    -- side-slot swap. Other side windows keep their existing positions.
+    publish_state()
+end
+
+local function coordinator_remove(id)
+    if not assignments[id] then
+        return
+    end
+
+    assignments[id] = nil
+
+    if id == current_main then
+        local replacement = nil
+
+        if coordinator_id and assignments[coordinator_id] then
+            replacement = coordinator_id
+        else
+            for _, candidate in ipairs(ordered_assignment_ids()) do
+                replacement = candidate
+                break
+            end
+        end
+
+        current_main = replacement
+    end
+
+    -- Do not resize immediately. A mass addon reload can generate many leaves
+    -- followed almost immediately by joins; all of them should collapse into
+    -- one final geometry update after the population settles.
+    schedule_population_reflow('client leave')
+end
+
+local function coordinator_reset(requester)
+    if not assignments[requester] then
+        return
+    end
+
+    cancel_population_reflow()
+    current_main = requester
+    repack_side_slots()
+
+    -- Reset must physically reapply geometry even if logical slot assignments
+    -- are unchanged. This repairs windows that were moved/resized externally.
+    apply_my_layout(true)
+    broadcast_state()
+    windower.send_ipc_message('focus_swap:force_apply')
+
+    windower.add_to_chat(
+        207,
+        ('[focus_swap] Layout reset. Reapplied %d-client geometry.')
+            :format(assignment_count())
+    )
+end
+
+local function promote_self()
+    local id = get_instance_id()
+
+    if not id or not my_slot or my_slot == 'main' or not coordinator_id then
+        return
+    end
+
+    if id == coordinator_id then
+        coordinator_promote(id)
+    else
+        windower.send_ipc_message(('focus_swap:promote_request:%s'):format(id))
+    end
+end
+
+windower.register_event('ipc message', function(msg)
+    if type(msg) ~= 'string' then
+        return
+    end
+
+    if parse_state(msg) then
+        return
+    end
+
+    if msg == 'focus_swap:discover' then
+        if get_instance_id() == coordinator_id and not population_reflow_due then
+            broadcast_state()
+        end
+        return
+    end
+
+    if msg == 'focus_swap:force_apply' then
+        apply_my_layout(true)
+        return
+    end
+
+    local id = msg:match('^focus_swap:join:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_assign(id)
+        end
+        return
+    end
+
+    id = msg:match('^focus_swap:promote_request:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_promote(id)
+        end
+        return
+    end
+
+    id = msg:match('^focus_swap:leave:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_remove(id)
+        end
+        return
+    end
+
+    id = msg:match('^focus_swap:reset_request:([^:]+)$')
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_reset(id)
+        end
+        return
+    end
+
+    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)$')
+    if new_coordinator then
+        if get_instance_id() == new_coordinator then
+            local departing_coordinator = coordinator_id
+
+            if departing_coordinator then
+                assignments[departing_coordinator] = nil
+            end
+
+            coordinator_id = new_coordinator
+
+            if not assignments[new_coordinator] then
+                assignments[new_coordinator] = 'pending'
+            end
+
+            if not current_main or not assignments[current_main] then
+                current_main = new_coordinator
+            end
+
+            last_coordinator_seen = now()
+            schedule_population_reflow('coordinator handoff')
+        end
+        return
+    end
+
+    if msg == 'focus_swap:coordinator_gone' then
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+        cancel_population_reflow()
+        last_coordinator_seen = 0
+        discovery_started = now()
+        windower.send_ipc_message('focus_swap:discover')
+        return
+    end
+end)
+
+windower.register_event('prerender', function()
+    -- Detect logout even when the addon was not unloaded. No geometry commands
+    -- are permitted while the client has no logged-in character.
+    refresh_instance_identity()
+    if not enabled then
+        return
+    end
+
+    local id = get_instance_id()
+    if not id then
+        return
+    end
+
+    local t = now()
+
+    -- Startup/recovery: only the currently focused FFXI client may establish a
+    -- coordinator, preventing multiple instances from racing for main.
+    if not coordinator_id then
+        -- A newly logged-in client must first look for an existing coordinator.
+        -- Otherwise the focused replacement can start a competing layout.
+        if not discovery_started then
+            discovery_started = t
+            windower.send_ipc_message('focus_swap:discover')
+        end
+        if is_focused() and (t - discovery_started) >= DISCOVERY_GRACE_SECONDS then
+            become_coordinator()
+        end
+        return
+    end
+
+    -- If the coordinator disappears without a clean unload, the focused client
+    -- can rebuild the layout after the heartbeat timeout.
+    if id ~= coordinator_id
+        and last_coordinator_seen > 0
+        and (t - last_coordinator_seen) >= COORDINATOR_TIMEOUT_SECONDS then
+
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+
+        if is_focused() then
+            become_coordinator()
+        end
+
+        return
+    end
+
+    if id == coordinator_id and population_reflow_due then
+        if t >= population_reflow_due then
+            settle_population_reflow()
+        end
+    elseif id == coordinator_id
+        and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
+
+        -- Never publish dirty/intermediate membership through the heartbeat.
+        -- The settle path above owns the next authoritative geometry update.
+        broadcast_state()
+    end
+
+    if not my_slot then
+        if (t - last_join_request) >= JOIN_RETRY_SECONDS then
+            request_slot()
+        end
+        return
+    end
+
+    if t < debounce_until then
+        return
+    end
+
+    local focused = is_focused()
+
+    -- Rising edge only: false -> true.
+    if focused and not last_focus then
+        promote_self()
+    end
+
+    last_focus = focused
+end)
+
+windower.register_event('unload', function()
+    announce_departure(get_instance_id())
+end)
+
+windower.register_event('addon command', function(cmd, ...)
+    cmd = cmd and cmd:lower() or ''
+
+    if cmd == 'on' then
+        enabled = true
+        sync_last_focus_state()
+        windower.add_to_chat(207, '[focus_swap] Enabled.')
+
+    elseif cmd == 'off' then
+        enabled = false
+        windower.add_to_chat(207, '[focus_swap] Disabled.')
+
+    elseif cmd == 'pos' then
+        local id = get_instance_id()
+        local total_clients = assignment_count()
+        local mode = layout_mode(total_clients)
+
+        windower.add_to_chat(
+            207,
+            ('[focus_swap] id=%s slot=%s clients=%d layout=%s main=%s coordinator=%s')
+                :format(
+                    tostring(id),
+                    tostring(my_slot),
+                    total_clients,
+                    mode,
+                    tostring(current_main),
+                    tostring(coordinator_id)
+                )
+        )
+
+    elseif cmd == 'apply' then
+        if my_slot then
+            apply_my_layout(true)
+        else
+            windower.add_to_chat(167, '[focus_swap] No runtime slot has been assigned yet.')
+        end
+
+    elseif cmd == 'reset' then
+        local id = get_instance_id()
+        if not id then
+            return
+        end
+
+        if id == coordinator_id then
+            coordinator_reset(id)
+        elseif coordinator_id then
+            windower.add_to_chat(207, '[focus_swap] Requesting layout reset...')
+            windower.send_ipc_message(('focus_swap:reset_request:%s'):format(id))
+        elseif is_focused() then
+            windower.add_to_chat(207, '[focus_swap] No coordinator found; rebuilding layout...')
+            become_coordinator()
+        else
+            windower.add_to_chat(167, '[focus_swap] Reset requires a coordinator or focused client.')
+        end
+
+    elseif cmd == 'help' or cmd == '' then
+        windower.add_to_chat(207, '[focus_swap] Commands:')
+        windower.add_to_chat(207, '//fswap on')
+        windower.add_to_chat(207, '//fswap off')
+        windower.add_to_chat(207, '//fswap pos')
+        windower.add_to_chat(207, '//fswap apply')
+        windower.add_to_chat(207, '//fswap reset')
+    end
+end))
+    if id then
+        if get_instance_id() == coordinator_id then
+            coordinator_reset(id)
+        end
+        return
+    end
+
+    local new_coordinator = msg:match('^focus_swap:handoff:([^:]+)$')
+    if new_coordinator then
+        if get_instance_id() == new_coordinator then
+            local departing_coordinator = coordinator_id
+
+            if departing_coordinator then
+                assignments[departing_coordinator] = nil
+            end
+
+            coordinator_id = new_coordinator
+
+            if not assignments[new_coordinator] then
+                assignments[new_coordinator] = 'pending'
+            end
+
+            if not current_main or not assignments[current_main] then
+                current_main = new_coordinator
+            end
+
+            last_coordinator_seen = now()
+            schedule_population_reflow('coordinator handoff')
+        end
+        return
+    end
+
+    if msg == 'focus_swap:coordinator_gone' then
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+        cancel_population_reflow()
+        last_coordinator_seen = 0
+        discovery_started = now()
+        windower.send_ipc_message('focus_swap:discover')
+        return
+    end
+end)
+
+windower.register_event('prerender', function()
+    -- Detect logout even when the addon was not unloaded. No geometry commands
+    -- are permitted while the client has no logged-in character.
+    refresh_instance_identity()
+    if not enabled then
+        return
+    end
+
+    local id = get_instance_id()
+    if not id then
+        return
+    end
+
+    local t = now()
+
+    -- Startup/recovery: only the currently focused FFXI client may establish a
+    -- coordinator, preventing multiple instances from racing for main.
+    if not coordinator_id then
+        -- A newly logged-in client must first look for an existing coordinator.
+        -- Otherwise the focused replacement can start a competing layout.
+        if not discovery_started then
+            discovery_started = t
+            windower.send_ipc_message('focus_swap:discover')
+        end
+        if is_focused() and (t - discovery_started) >= DISCOVERY_GRACE_SECONDS then
+            become_coordinator()
+        end
+        return
+    end
+
+    -- If the coordinator disappears without a clean unload, the focused client
+    -- can rebuild the layout after the heartbeat timeout.
+    if id ~= coordinator_id
+        and last_coordinator_seen > 0
+        and (t - last_coordinator_seen) >= COORDINATOR_TIMEOUT_SECONDS then
+
+        coordinator_id = nil
+        current_main = nil
+        assignments = {}
+        my_slot = nil
+        applied_layout_signature = nil
+
+        if is_focused() then
+            become_coordinator()
+        end
+
+        return
+    end
+
+    if id == coordinator_id and population_reflow_due then
+        if t >= population_reflow_due then
+            settle_population_reflow()
+        end
+    elseif id == coordinator_id
+        and (t - last_state_broadcast) >= STATE_HEARTBEAT_SECONDS then
+
+        -- Never publish dirty/intermediate membership through the heartbeat.
+        -- The settle path above owns the next authoritative geometry update.
+        broadcast_state()
+    end
+
+    if not my_slot then
+        if (t - last_join_request) >= JOIN_RETRY_SECONDS then
+            request_slot()
+        end
+        return
+    end
+
+    if t < debounce_until then
+        return
+    end
+
+    local focused = is_focused()
+
+    -- Rising edge only: false -> true.
+    if focused and not last_focus then
+        promote_self()
+    end
+
+    last_focus = focused
+end)
+
+windower.register_event('unload', function()
+    announce_departure(get_instance_id())
+end)
+
+windower.register_event('addon command', function(cmd, ...)
+    cmd = cmd and cmd:lower() or ''
+
+    if cmd == 'on' then
+        enabled = true
+        sync_last_focus_state()
+        windower.add_to_chat(207, '[focus_swap] Enabled.')
+
+    elseif cmd == 'off' then
+        enabled = false
+        windower.add_to_chat(207, '[focus_swap] Disabled.')
+
+    elseif cmd == 'pos' then
+        local id = get_instance_id()
+        local total_clients = assignment_count()
+        local mode = layout_mode(total_clients)
+
+        windower.add_to_chat(
+            207,
+            ('[focus_swap] id=%s slot=%s clients=%d layout=%s main=%s coordinator=%s')
+                :format(
+                    tostring(id),
+                    tostring(my_slot),
+                    total_clients,
+                    mode,
+                    tostring(current_main),
+                    tostring(coordinator_id)
+                )
+        )
+
+    elseif cmd == 'apply' then
+        if my_slot then
+            apply_my_layout(true)
+        else
+            windower.add_to_chat(167, '[focus_swap] No runtime slot has been assigned yet.')
+        end
+
+    elseif cmd == 'reset' then
+        local id = get_instance_id()
+        if not id then
+            return
+        end
+
+        if id == coordinator_id then
+            coordinator_reset(id)
+        elseif coordinator_id then
+            windower.add_to_chat(207, '[focus_swap] Requesting layout reset...')
+            windower.send_ipc_message(('focus_swap:reset_request:%s'):format(id))
+        elseif is_focused() then
+            windower.add_to_chat(207, '[focus_swap] No coordinator found; rebuilding layout...')
+            become_coordinator()
+        else
+            windower.add_to_chat(167, '[focus_swap] Reset requires a coordinator or focused client.')
+        end
+
+    elseif cmd == 'help' or cmd == '' then
+        windower.add_to_chat(207, '[focus_swap] Commands:')
+        windower.add_to_chat(207, '//fswap on')
+        windower.add_to_chat(207, '//fswap off')
+        windower.add_to_chat(207, '//fswap pos')
+        windower.add_to_chat(207, '//fswap apply')
+        windower.add_to_chat(207, '//fswap reset')
+    end
+end))
 
     if not new_coordinator then
         return false
