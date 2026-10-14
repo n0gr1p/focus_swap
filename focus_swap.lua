@@ -1,6 +1,6 @@
 _addon.name = 'focus_swap'
 _addon.author = 'Peter + ChatGPT'
-_addon.version = '0.4.3'
+_addon.version = '0.5.2'
 _addon.command = 'fswap'
 
 local enabled = true
@@ -14,6 +14,7 @@ local population_reflow_due = nil
 local population_reflow_reason = nil
 local pending_promote_id = nil
 local discovery_started = nil
+local selected_layout = 1
 
 local JOIN_RETRY_SECONDS = 0.5
 local STATE_HEARTBEAT_SECONDS = 2.0
@@ -28,6 +29,22 @@ local MAX_CLIENTS = 10
 -- right is the usable area of the secondary monitor, excluding the taskbar.
 local main_layout = { x = 0, y = 0, w = 1920, h = 1035 }
 local right_monitor = { x = 1920, y = 0, w = 1920, h = 1035 }
+-- Usable work areas, in Windows virtual desktop coordinates. Confirm the
+-- origin and work-area height for screens 2 and 4 on this installation.
+local left_monitor = { x = -1920, y = 0, w = 1920, h = 1035 }
+local upper_monitor = { x = 0, y = -1080, w = 1920, h = 1035 }
+local layout_names = {
+    'Classic (1 + tiled 3)',
+    'Dual left (1 + 2 + tiled 3)',
+    'Triple (1 + 2 + 4 + tiled 3)',
+    'Dual top (1 + 4 + tiled 3)',
+}
+local full_screen_slots = {
+    [1] = {},
+    [2] = {left_monitor},
+    [3] = {left_monitor, upper_monitor},
+    [4] = {upper_monitor},
+}
 
 -- Runtime-only state. Character names are used only as transient IPC identity;
 -- there is no configured character -> slot mapping.
@@ -93,58 +110,101 @@ local function layout_mode(total_clients)
         return 'two-wide', 2, 1
     elseif side_count <= 4 then
         return 'quad', 2, 2
+    elseif side_count <= 6 then
+        return 'spotlight', 3, 3
     else
         return 'nine', 3, 3
     end
 end
 
+-- Five and six tiled clients share the same stable 3x3 cell footprint.
+-- The first tiled client occupies the upper-left 2x2 area; the other
+-- clients occupy the two right-hand cells followed by the bottom row.
+-- With only five clients, bottom-right stays empty rather than shrinking
+-- the large client. Every rectangle preserves the main-window aspect.
+local function layout_for_spotlight_tiled(index)
+    local aspect = main_layout.w / main_layout.h
+    local cell_w = math.max(1, math.floor(math.min(
+        right_monitor.w / 3,
+        right_monitor.h * aspect / 3
+    )))
+    local cell_h = math.max(1, math.floor(cell_w / aspect))
+    local grid_x = right_monitor.x
+        + math.floor((right_monitor.w - 3 * cell_w) / 2)
+    local grid_y = right_monitor.y
+        + math.floor((right_monitor.h - 3 * cell_h) / 2)
+
+    if index == 1 then
+        return {
+            x = grid_x, y = grid_y,
+            w = 2 * cell_w, h = 2 * cell_h,
+        }
+    end
+
+    local small_positions = {
+        {2, 0}, -- upper right
+        {2, 1}, -- middle right
+        {0, 2}, -- bottom left
+        {1, 2}, -- bottom middle
+        {2, 2}, -- bottom right (only with six tiled clients)
+    }
+    local position = small_positions[index - 1]
+    if not position then return nil end
+
+    return {
+        x = grid_x + position[1] * cell_w,
+        y = grid_y + position[2] * cell_h,
+        w = cell_w, h = cell_h,
+    }
+end
+
 local function layout_for(slot, total_clients)
     if slot == 'main' then
         return {
-            x = main_layout.x,
-            y = main_layout.y,
-            w = main_layout.w,
-            h = main_layout.h,
+            x = main_layout.x, y = main_layout.y,
+            w = main_layout.w, h = main_layout.h,
         }
     end
 
     local index = side_slot_index(slot)
-    if not index then
-        return nil
+    if not index then return nil end
+
+    local fullscreen = full_screen_slots[selected_layout] or {}
+    if index <= #fullscreen then
+        if index >= total_clients then return nil end
+        local screen = fullscreen[index]
+        return { x = screen.x, y = screen.y, w = screen.w, h = screen.h }
     end
 
-    local side_count = math.max(0, total_clients - 1)
-    if index > side_count then
-        return nil
+    local tiled_index = index - #fullscreen
+    local tiled_count = math.max(0, total_clients - 1 - #fullscreen)
+    if tiled_index > tiled_count then return nil end
+
+    if tiled_count >= 5 and tiled_count <= 6 then
+        return layout_for_spotlight_tiled(tiled_index)
     end
 
-    local _, columns, rows = layout_mode(total_clients)
-    if columns == 0 or rows == 0 then
-        return nil
-    end
+    local _, columns, rows = layout_mode(tiled_count + 1)
+    if columns == 0 or rows == 0 then return nil end
 
     local aspect = main_layout.w / main_layout.h
     local cell_w = math.floor(right_monitor.w / columns)
     local natural_h = math.floor((cell_w / aspect) + 0.5)
     local max_h = math.floor(right_monitor.h / rows)
     local cell_h = math.min(natural_h, max_h)
-
     local grid_w = cell_w * columns
     local grid_h = cell_h * rows
     local grid_x = right_monitor.x + math.floor((right_monitor.w - grid_w) / 2)
     local grid_y = right_monitor.y + math.floor((right_monitor.h - grid_h) / 2)
 
-    local zero_index = index - 1
+    local zero_index = tiled_index - 1
     local column = zero_index % columns
     local row = math.floor(zero_index / columns)
-
-    if row >= rows then
-        return nil
-    end
+    if row >= rows then return nil end
 
     return {
-        x = grid_x + (column * cell_w),
-        y = grid_y + (row * cell_h),
+        x = grid_x + column * cell_w,
+        y = grid_y + row * cell_h,
         w = cell_w,
         h = cell_h,
     }
@@ -204,7 +264,8 @@ local function apply_my_layout(force)
         if move_to(my_slot, total_clients) then
             applied_layout_signature = signature
 
-            local mode = layout_mode(total_clients)
+            local tiled_count = math.max(0, total_clients - 1 - #(full_screen_slots[selected_layout] or {}))
+            local mode = layout_mode(tiled_count + 1)
             windower.add_to_chat(
                 207,
                 ('[focus_swap] Runtime slot: %s | clients=%d | layout=%s%s')
@@ -358,10 +419,11 @@ local function broadcast_state()
         return
     end
 
-    local msg = ('focus_swap:state:%s:%s:%s')
+    local msg = ('focus_swap:state:%s:%s:%d:%s')
         :format(
             tostring(coordinator_id or ''),
             tostring(current_main or ''),
+            selected_layout,
             serialize_assignments()
         )
 
@@ -448,8 +510,8 @@ local function apply_shared_state(new_coordinator, new_main, new_assignments)
 end
 
 local function parse_state(msg)
-    local new_coordinator, new_main, payload =
-        msg:match('^focus_swap:state:([^:]*):([^:]*):(.*)$')
+    local new_coordinator, new_main, layout_string, payload =
+        msg:match('^focus_swap:state:([^:]*):([^:]*):([1-4]):(.*)$')
 
     if not new_coordinator then
         return false
@@ -465,6 +527,7 @@ local function parse_state(msg)
 
     last_coordinator_seen = now()
     discovery_started = nil
+    selected_layout = tonumber(layout_string)
     apply_shared_state(new_coordinator, new_main, new_assignments)
     return true
 end
@@ -582,6 +645,23 @@ local function coordinator_remove(id)
     schedule_population_reflow('client leave')
 end
 
+local function coordinator_select_layout(requester, layout)
+    if not assignments[requester] or type(layout) ~= 'number'
+        or layout < 1 or layout > 4 then
+        return
+    end
+    if selected_layout == layout then
+        return
+    end
+    selected_layout = layout
+    -- Each client applies geometry only if its signature changes. The IPC
+    -- state is authoritative and includes this preset, even across handoff.
+    broadcast_state()
+    apply_my_layout(false)
+    windower.add_to_chat(207,
+        ('[focus_swap] Layout %d: %s'):format(layout, layout_names[layout]))
+end
+
 local function coordinator_reset(requester)
     if not assignments[requester] then
         return
@@ -660,6 +740,12 @@ windower.register_event('ipc message', function(msg)
         if get_instance_id() == coordinator_id then
             coordinator_remove(id)
         end
+        return
+    end
+
+    local requester, layout = msg:match('^focus_swap:layout_request:([^:]+):([1-4])$')
+    if requester and get_instance_id() == coordinator_id then
+        coordinator_select_layout(requester, tonumber(layout))
         return
     end
 
@@ -808,10 +894,44 @@ windower.register_event('addon command', function(cmd, ...)
         enabled = false
         windower.add_to_chat(207, '[focus_swap] Disabled.')
 
+    elseif cmd == 'layout' then
+        local requested = select(1, ...)
+        if requested == 'status' then
+            windower.add_to_chat(207,
+                ('[focus_swap] Layout %d: %s | main=%s | clients=%d')
+                    :format(selected_layout, layout_names[selected_layout],
+                        tostring(current_main), assignment_count()))
+            for _, assigned_id in ipairs(ordered_assignment_ids()) do
+                windower.add_to_chat(207,
+                    ('[focus_swap] %s -> %s')
+                        :format(assigned_id, assignments[assigned_id]))
+            end
+            return
+        end
+
+        local number = requested and tonumber(requested)
+            or ((selected_layout % 4) + 1)
+        if not number or number % 1 ~= 0 or number < 1 or number > 4 then
+            windower.add_to_chat(167, '[focus_swap] Usage: //fswap layout [1-4|status]')
+            return
+        end
+        local id = get_instance_id()
+        if not id or not my_slot or not coordinator_id then
+            windower.add_to_chat(167, '[focus_swap] Wait for a coordinator and slot before changing layouts.')
+            return
+        end
+        if id == coordinator_id then
+            coordinator_select_layout(id, number)
+        else
+            windower.send_ipc_message(
+                ('focus_swap:layout_request:%s:%d'):format(id, number))
+        end
+
     elseif cmd == 'pos' then
         local id = get_instance_id()
         local total_clients = assignment_count()
-        local mode = layout_mode(total_clients)
+        local tiled_count = math.max(0, total_clients - 1 - #(full_screen_slots[selected_layout] or {}))
+        local mode = layout_mode(tiled_count + 1)
 
         windower.add_to_chat(
             207,
@@ -856,6 +976,7 @@ windower.register_event('addon command', function(cmd, ...)
         windower.add_to_chat(207, '//fswap on')
         windower.add_to_chat(207, '//fswap off')
         windower.add_to_chat(207, '//fswap pos')
+        windower.add_to_chat(207, '//fswap layout [1-4|status]')
         windower.add_to_chat(207, '//fswap apply')
         windower.add_to_chat(207, '//fswap reset')
     end
